@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <title>CAPACITACIONES A OPERADORES</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+    </head>
+<body>
+
+ <header style="position: relative; background-color: #003a79; color: white; padding: 20px; text-align: center;">
+    
+    <div style="position: absolute; top: 15px; left: 15px; display: flex; align-items: center; gap: 10px;">
+        <span style="font-size: 12px; color: rgba(255,255,255,0.8); font-weight: bold; font-family: sans-serif; margin-top: 5px;">
+            V1 - creada por: Capacitación CAS &reg;
+        </span>
+    </div>
+
+    <h1 style="margin: 0; font-size: 24px;">GIC - Gestión Integral de Capacitación</h1>
+    
+    <button onclick="abrirManualGIC()" style="position: absolute; top: 25px; right: 300px; background-color: #f39c12; color: white; padding: 10px 15px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; font-size: 14px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+        <i class="fa-solid fa-circle-question"></i> Ayuda e IT
+    </button>
+
+    <button id="btnLogin" onclick="solicitarAcceso()" style="position: absolute; top: 25px; right: 20px; background-color: #34495e; color: white; padding: 10px 20px; border: none; border-radius: 5px; font-weight: bold; cursor: pointer; transition: background 0.3s;">
+        <i class="fa-solid fa-lock"></i> Activar Edición
+    </button>
+</header>
+
+    <nav class="navegacion-modulos">
+        <button class="tab-btn active" onclick="cambiarModulo('vista-matriz', this)">📊 Matriz General</button>
+        
+        <button class="tab-btn admin-only" style="display: none;" onclick="cambiarModulo('vista-planificacion', this)">📅 Agenda Diaria</button>
+        <button class="tab-btn admin-only" style="display: none;" onclick="cambiarModulo('vista-tablero', this)">📈 Tablero Jefatura</button>
+        <button class="tab-btn admin-only" style="display: none;" onclick="cambiarModulo('vista-agenda-entrenadores', this)">📆 Planificación de Entrenadores</button>
+        <button type="button" class="admin-only" style="display: none; background-color: #16a085; color: white; padding: 10px; border-radius: 5px; border: none; cursor: pointer;" onclick="console.log('Clic desde HTML'); modalExportacionAvanzada();">🔍 Exportación a Medida</button>
+     
+        <button style="background-color: #8e44ad; color: white; padding: 10px; border-radius: 5px; border: none; cursor: pointer; font-weight: bold;" onclick="descargarInformeEvaluaciones()">📋 Descargar Informe de Evaluaciones</button>
+        
+        <button class="admin-only" style="display: none; background-color: #d35400; color: white; font-weight: bold; padding: 10px; border-radius: 5px; border: none; cursor: pointer;" onclick="accederManuales()">📚 Biblioteca de Manuales</button>
+    </nav>
+
+    <main id="contenedor-principal">
+        <div id="vista-matriz" class="modulo-contenido activo">
+            <section class="stats">
+                <div class="card"><h3>Operadores</h3><p id="totalOperadores">0</p></div>
+                <div class="card"><h3>Cursos</h3><p id="totalCursos">0</p></div>
+                <div class="card"><h3>Cobertura</h3><p id="cobertura">0%</p></div>
+            </section>
+
+           <section class="acciones">
+                <input id="buscador" placeholder="Buscar operador...">
+                
+                <button id="btnVerBajas" onclick="alternarBajas()" style="background-color: #7f8c8d; color: white; font-weight: bold;">👁️ Ver Bajas</button>
+                
+               <button class="btn-accion" style="background-color: #2980b9;" onclick="descargarMatrizExcel()">
+    <i class="fa-solid fa-download"></i> Exportar Matriz
+</button>
+                <button onclick="verReporteCursos()" style="background-color: #8e44ad; color: white;">📊 Reporte por Producto</button>
+
+               <div id="panelAdmin" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px dashed #ccc;">
+                    <button onclick="agregarOperador()">Agregar operador</button>
+                    <button onclick="gestionarProductos()" style="background-color: #f39c12; color: white;">⚙️ Gestionar Productos</button>
+                    <button onclick="agregarProducto()" style="background-color: #27ae60; color: white;">➕ Agregar Producto</button>
+                    
+                    <button onclick="verHistorialAuditoria()" style="background-color: #8e44ad; color: white;">🕵️ Control de Cambios</button>
+                    
+                    <button onclick="descargarBackup()" style="background-color: #2c3e50; color: white;">📥 Descargar Backup</button>
+                    <button onclick="document.getElementById('file-upload').click()" style="background-color: #e67e22; color: white;">📤 Restaurar Backup</button>
+                    <input type="file" id="file-upload" accept=".json" style="display: none;" onchange="restaurarBackup(event)">
+                      </div>
+            </section>
+
+            <section class="grafico">
+                <div style="text-align: center; margin-bottom: 15px;">
+                    <label style="font-weight: bold; font-size: 16px;">Ver métricas de: </label>
+                    <select id="filtroProducto" onchange="actualizarDashboard()" style="padding: 8px; border-radius: 5px; font-weight: bold; cursor: pointer;">
+                        <option value="TODOS">Todos los productos (General)</option>
+                    </select>
+                </div>
+                <div class="contenedor-canvas">
+                    <canvas id="grafico"></canvas>
+                </div>
+            </section>
+
+            <section>
+                <table id="tabla">
+                    <thead><tr id="encabezado"></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </section>
+        </div>
+
+        <div id="vista-planificacion" class="modulo-contenido">
+            <div class="header-planificacion">
+                <div>
+                    <h2 style="color: #2c3e50; margin: 0;">📅 Agenda de Capacitaciones</h2>
+                    <p style="color: #7f8c8d; margin: 5px 0 0 0;">Programá y gestioná los Requerimientos del equipo</p>
+                </div>
+                <button class="btn-nueva-sesion" onclick="abrirModalNuevaSesion()">➕ Nuevo Requerimiento</button>
+            </div>
+            <div id="contenedor-sesiones" class="grid-sesiones"></div>
+            <hr style="border: 0; border-top: 2px dashed #bdc3c7; margin: 40px 0 20px 0;">
+            <h3 style="color: #7f8c8d; margin-bottom: 20px;"><i class="fa-solid fa-box-archive"></i> Historial de Requerimientos (Archivados)</h3>
+            <div id="contenedor-archivadas" class="grid-sesiones"></div>
+        </div>
+
+        <div id="vista-tablero" class="modulo-contenido">
+            <h2 style="text-align: center; color: #2c3e50; margin-top: 20px;">📈 Tablero Ejecutivo y Métricas</h2>
+            <section class="stats" style="margin-bottom: 30px;">
+                <div class="card" style="border-left: 5px solid #8e44ad;"><h3>Promedio General (Notas)</h3><p id="kpi-promedio">0%</p></div>
+                <div class="card" style="border-left: 5px solid #f39c12;"><h3>Capacitaciones Finalizadas</h3><p id="kpi-sesiones-cerradas">0</p></div>
+                <div class="card" style="border-left: 5px solid #2980b9;"><h3>Total Operadores</h3><p id="kpi-total-ops">0</p></div>
+            </section>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; max-width: 1000px; margin: 0 auto;">
+                <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05);"><canvas id="graficoTopCursos"></canvas></div>
+                <div style="background: white; padding: 20px; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.05);"><canvas id="graficoDistribucionNotas"></canvas></div>
+            </div>
+        </div>
+
+        <div id="vista-agenda-entrenadores" class="modulo-contenido">
+            <div class="header-planificacion">
+                <div>
+                    <h2 style="color: #2c3e50; margin: 0;">📆 Agenda Anual de Entrenadores</h2>
+                </div>
+                <button class="btn-nueva-sesion" onclick="abrirModalNuevaActividad()">➕ Nueva Actividad</button>
+            </div>
+            <div id="contenedor-actividades" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; padding: 20px 0;"></div>
+            <hr style="border: 0; border-top: 1px solid #ccc; margin: 20px 0;">
+            <h3 style="text-align: center; color: #2c3e50; margin-bottom: 20px;"><i class="fa-regular fa-calendar-days"></i> Calendario Anual Interactivo</h3>
+            <div id="contenedor-calendario"></div>
+        </div>
+    </main>
+
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+    <script src="app.js"></script>
+
+</body>
+</html>

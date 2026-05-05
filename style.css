@@ -1,0 +1,476 @@
+body{
+font-family:Arial;
+background:#f4f6fb;
+margin:0;
+}
+
+header{
+background:#1f4fb2;
+color:white;
+padding:25px;
+}
+
+.subtitulo{
+opacity:0.8;
+}
+
+/* --- TABLA PRO: ENCABEZADO Y PRIMERA COLUMNA FIJOS --- */
+
+/* Contenedor de la tabla para habilitar el scroll interno */
+table {
+    border-collapse: separate; /* Necesario para que el sticky funcione perfecto */
+    border-spacing: 0;
+    width: 100%;
+}
+
+/* Encabezado fijo arriba */
+th {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+    background-color: #1a5276; /* Ajusta este color al azul de tu diseño */
+    color: white;
+    padding: 10px;
+    border: 1px solid #ddd;
+}
+
+/* Primera columna (Nombres) fija a la izquierda */
+td:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 1;
+    background-color: #f8f9f9; /* Un fondo gris clarito para diferenciar */
+    font-weight: bold;
+    box-shadow: 2px 0 5px rgba(0,0,0,0.1); /* Sombra pro para dar efecto de profundidad */
+    border: 1px solid #ddd;
+}
+
+/* Esquina superior izquierda (Operador) por encima de todo */
+th:first-child {
+    position: sticky;
+    left: 0;
+    z-index: 3;
+    background-color: #154360; /* Un azul más oscuro para la esquina */
+}
+
+/* Mejorar el aspecto de la celda al pasar el mouse (Hover) */
+tbody tr:hover td {
+    background-color: #e8f8f5; /* Un verde agua sutil al seleccionar una fila */
+}
+tbody tr:hover td:first-child {
+    background-color: #d1f2eb; /* Mantener la jerarquía en la columna fija */
+}
+.stats{
+display:flex;
+gap:20px;
+padding:20px;
+}
+
+.card{
+background:white;
+padding:20px;
+border-radius:10px;
+box-shadow:0 3px 10px rgba(0,0,0,0.1);
+flex:1;
+text-align:center;
+}
+
+.card p{
+font-size:28px;
+font-weight:bold;
+}
+
+.acciones{
+padding:20px;
+display:flex;
+gap:10px;
+}
+
+button{
+background:#1f4fb2;
+color:white;
+border:none;
+padding:10px 16px;
+border-radius:6px;
+cursor:pointer;
+}
+
+table{
+width:100%;
+border-collapse:collapse;
+background:white;
+}
+
+th{
+background:#1f4fb2;
+color:white;
+padding:10px;
+}
+
+td{
+padding:10px;
+border-bottom:1px solid #eee;
+text-align:center;
+cursor:pointer;
+}
+
+.estado {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    margin-bottom: 5px;
+}
+.rojo { background-color: #ff4444; }
+.amarillo { background-color: #ffbb33; }
+.verde { background-color: #00c851; }
+
+.miniInfo{
+font-size:10px;
+margin-top:4px;
+opacity:0.7;
+}
+
+.btnEliminar{
+background:none;
+border:none;
+cursor:pointer;
+color:red;
+font-size:18px;
+}
+
+.btnEliminar:hover{
+transform:scale(1.2);
+}
+
+.grafico{
+width:400px;
+margin:30px auto;
+}
+
+/* --- Estilos para la Columna de Área --- */
+.badge-area {
+    display: inline-block;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-weight: bold;
+    font-size: 12px;
+    color: white;
+    cursor: pointer;
+    text-align: center;
+    width: 40px;
+}
+.area-mda { background-color: #d35400; } /* Naranja para MDA */
+.area-cr { background-color: #27ae60; }  /* Verde oscuro para CR */
+.area-vacia { background-color: #bdc3c7; color: #333; } /* Gris si no tiene */
+
+/* --- Límite estricto para que el gráfico no crezca infinitamente --- */
+.contenedor-canvas {
+    position: relative;
+    height: 300px; /* ¡Esta es la clave mágica! */
+    width: 100%;
+    max-width: 500px; /* Para que no se estire a los costados en pantallas gigantes */
+    margin: 0 auto;   /* Para centrarlo */
+}
+
+/* =========================================
+   🔒 ZONA DE SEGURIDAD Y ADMINISTRACIÓN
+========================================= */
+
+/* --- Botón de Login --- */
+#btnLogin {
+    font-size: 15px;
+    padding: 10px 20px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    font-weight: bold;
+    transition: all 0.3s ease; /* Hace que el cambio de color y movimiento sea suave */
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); /* Sombrita base */
+}
+
+/* Efecto al pasar el mouse por encima del botón */
+#btnLogin:hover {
+    transform: translateY(-2px); /* Se levanta un poquito */
+    box-shadow: 0 6px 10px rgba(0, 0, 0, 0.15); /* La sombra se hace más grande */
+}
+
+/* --- Panel de herramientas oculto --- */
+#panelAdmin {
+    background-color: #f8f9fa; /* Un gris muy clarito y limpio */
+    padding: 15px 20px;
+    border-radius: 8px;
+    border-left: 5px solid #34495e; /* Línea lateral para enmarcarlo */
+    margin-top: 15px;
+    box-shadow: inset 0 0 10px rgba(0,0,0,0.05); /* Sombra interna sutil */
+    
+    /* Flexbox para que los botones se acomoden solos y no se amontonen */
+    display: flex; 
+    flex-wrap: wrap; 
+    gap: 12px; 
+    justify-content: center;
+    align-items: center;
+
+    /* Animación de entrada */
+    animation: deslizarAbajo 0.4s ease-out forwards;
+}
+
+/* Magia de la animación: hace que aparezca de la nada deslizando hacia abajo */
+@keyframes deslizarAbajo {
+    0% {
+        opacity: 0;
+        transform: translateY(-15px);
+    }
+    100% {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* =========================================
+   🗂️ NAVEGACIÓN POR MÓDULOS (TABS)
+========================================= */
+.navegacion-modulos {
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+    margin: 20px auto;
+    background: #ecf0f1;
+    padding: 10px;
+    border-radius: 8px;
+    max-width: 900px;
+    box-shadow: inset 0 2px 5px rgba(0,0,0,0.05);
+}
+
+.tab-btn {
+    background: transparent;
+    border: none;
+    padding: 12px 24px;
+    font-size: 16px;
+    font-weight: bold;
+    color: #7f8c8d;
+    cursor: pointer;
+    border-radius: 5px;
+    transition: all 0.3s ease;
+}
+
+.tab-btn:hover {
+    color: #2c3e50;
+    background: #dfe6e9;
+}
+
+/* El botón que está seleccionado en ese momento */
+.tab-btn.active {
+    background: #3498db;
+    color: white;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+}
+
+/* Ocultamos los módulos por defecto */
+.modulo-contenido {
+    display: none; 
+    animation: fadeTab 0.4s ease-in-out;
+}
+
+/* Solo mostramos el que tiene la clase 'activo' */
+.modulo-contenido.activo {
+    display: block; 
+}
+
+/* Animación de entrada suave */
+@keyframes fadeTab {
+    from { opacity: 0; transform: translateY(10px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+/* =========================================
+   📅 MÓDULO DE PLANIFICACIÓN (SESIONES)
+========================================= */
+.header-planificacion {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: white;
+    padding: 20px;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    margin-bottom: 20px;
+}
+
+.btn-nueva-sesion {
+    background-color: #27ae60;
+    color: white;
+    border: none;
+    padding: 12px 20px;
+    font-size: 16px;
+    font-weight: bold;
+    border-radius: 5px;
+    cursor: pointer;
+    transition: transform 0.2s, box-shadow 0.2s;
+}
+
+.btn-nueva-sesion:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(39, 174, 96, 0.3);
+}
+
+/* Grilla responsive para las tarjetas */
+.grid-sesiones {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 20px;
+}
+
+/* Diseño de la Tarjeta de Sesión */
+.card-sesion {
+    background: white;
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    display: flex;
+    flex-direction: column;
+}
+
+.card-sesion-header {
+    background: #2980b9;
+    color: white;
+    padding: 15px;
+    position: relative;
+}
+
+.card-sesion-header h3 {
+    margin: 0 0 5px 0;
+    font-size: 18px;
+}
+
+.entrenador {
+    margin: 0;
+    font-size: 13px;
+    opacity: 0.9;
+}
+
+.badge-tipo {
+    position: absolute;
+    top: 15px;
+    right: 15px;
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 12px;
+}
+
+.badge-tipo.ce { background: #f1c40f; color: #333; }
+.badge-tipo.cr { background: #e67e22; color: white; }
+
+.card-sesion-body {
+    padding: 15px;
+    flex-grow: 1;
+}
+
+.fecha-sesion {
+    font-weight: bold;
+    color: #34495e;
+    margin-top: 0;
+}
+
+.links-sesion {
+    display: flex;
+    gap: 10px;
+    margin-bottom: 15px;
+}
+
+.link-btn {
+    flex: 1;
+    text-align: center;
+    padding: 8px;
+    border-radius: 4px;
+    text-decoration: none;
+    font-size: 13px;
+    font-weight: bold;
+    color: white;
+}
+
+.link-btn.form-eval { background: #8e44ad; }
+.link-btn.form-encuesta { background: #16a085; }
+.link-btn.form-kahoot { background: #46178f; } /* Color oficial de Kahoot */
+
+.divisor {
+    border: 0;
+    border-top: 1px dashed #bdc3c7;
+    margin: 15px 0;
+}
+
+.titulo-asistencia {
+    font-size: 14px;
+    color: #7f8c8d;
+    margin-bottom: 10px;
+}
+
+.lista-asistencia {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+.lista-asistencia li {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid #ecf0f1;
+    font-size: 13px;
+    font-weight: bold;
+}
+
+.select-asistencia {
+    padding: 4px;
+    border-radius: 4px;
+    border: 1px solid #bdc3c7;
+    font-size: 12px;
+}
+
+.card-sesion-footer {
+    padding: 15px;
+    background: #f8f9fa;
+    border-top: 1px solid #ecf0f1;
+}
+
+.btn-cerrar-sesion {
+    width: 100%;
+    background: #34495e;
+    color: white;
+    border: none;
+    padding: 10px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-weight: bold;
+}
+.btn-cerrar-sesion:hover { background: #2c3e50; }
+
+/* Bloque de Fechas y Horarios en la Tarjeta */
+.info-fechas {
+    background-color: #f4f6f7;
+    padding: 10px;
+    border-radius: 6px;
+    margin-bottom: 15px;
+    font-size: 13px;
+    color: #2c3e50;
+    border-left: 3px solid #3498db;
+}
+
+.info-fechas p {
+    margin: 5px 0;
+    display: flex;
+    align-items: center;
+    gap: 8px; /* Separación entre el ícono y el texto */
+}
+
+.info-fechas i {
+    color: #7f8c8d; /* Color de los íconos de calendario/reloj */
+}
+
+.badge-tipo.ce { background: #f1c40f; color: #333; }
+.badge-tipo.cr { background: #e67e22; color: white; }
+.badge-tipo.va { background: #3498db; color: white; } /* Azul para Verificación Anual */
+.badge-tipo.ei { background: #2ecc71; color: white; } /* Verde para Entrenamiento Inicial */
+.badge-tipo.vrs { background: #9b59b6; color: white; } /* Violeta para Req. del Sector */

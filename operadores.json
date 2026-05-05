@@ -1,0 +1,20 @@
+[
+{
+"nombre":"AMOEDO MARIELA",
+"cursos":{
+"CREDICOOP":"verde",
+"BPI":"verde",
+"CHEQUES":"rojo",
+"CHAT MDA":"verde"
+}
+},
+{
+"nombre":"BUCZARSKI NOELIA",
+"cursos":{
+"CREDICOOP":"verde",
+"BPI":"rojo",
+"CHEQUES":"rojo",
+"CHAT MDA":"verde"
+}
+}
+]
