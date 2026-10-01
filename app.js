@@ -41,11 +41,19 @@ const SEGMENTOS_PERMITIDOS = {
 // Devuelve la lista de segmentos que puede ver el email dado
 function segmentosPermitidosDe(email) {
     email = (email || "").toLowerCase().trim();
-    if (!email) return SEGMENTOS_PERMITIDOS.publico;
-    if (esAdminFijo(email)) return SEGMENTOS_PERMITIDOS.admin;
-    let rol = rolDeEmail(email);
-    if (rol === null) return SEGMENTOS_PERMITIDOS.admin; // perfil edición = ve todo
-    return SEGMENTOS_PERMITIDOS[rol] || SEGMENTOS_PERMITIDOS.lectura;
+    if (!email) return SEGMENTOS_PERMITIDOS.publico;      // sin login → solo Operadores
+    if (esAdminFijo(email)) return SEGMENTOS_PERMITIDOS.admin; // admin → todo
+    if (rolDeEmail(email) === null) return SEGMENTOS_PERMITIDOS.admin; // perfil edición sin tildes → todo
+
+    // Usuario con config: sus segmentos tildados (Operador siempre incluido)
+    let entry = Object.values(usuariosConfig).find(u => (u.email || "").toLowerCase() === email);
+    if (entry && Array.isArray(entry.segmentos) && entry.segmentos.length > 0) {
+        let segs = entry.segmentos.slice();
+        if (!segs.includes("Operador")) segs.unshift("Operador"); // Operadores siempre visible
+        return segs;
+    }
+    // Sin tildes configurados → solo Operadores
+    return ["Operador"];
 }
 
 // Config de usuarios cargada desde la base (se llena al arrancar)
@@ -65,8 +73,9 @@ function rolDeEmail(email) {
         if (entry.perfil === "supervisor") return "supervisor";
         if (entry.perfil === "gerente") return "gerente";
     }
-    // Fallback al mapa viejo
-    return ROLES_POR_EMAIL[email] || null;
+    // Fallback al mapa viejo; si tampoco está, NO es admin: solo lectura mínima por seguridad
+    if (ROLES_POR_EMAIL[email]) return ROLES_POR_EMAIL[email];
+    return "lectura"; // usuario logueado pero sin perfil asignado → solo lectura (no admin)
 }
 
 // ¿El email está bloqueado en la config?
@@ -105,6 +114,41 @@ const SEGMENTOS = ["Operador", "Líder", "Supervisor", "Analista"]; // segmentos
 const CLAVE_SECRETA = "Capacitacion2026"; 
 // Segmento efectivo de una persona (los que no tienen campo quedan como Operador)
 function segmentoDe(op) { return op.segmento || "Operador"; }
+
+// Normaliza un score/porcentaje sin importar cómo venga de Excel/SurveyMonkey.
+// Celda con formato % → xlsx da fracción (0.85) → 85. Texto "85%"/"85,5" → 85/85.5. Kahoot (>100) → se deja.
+function normScore(v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'number') {
+        if (v > 0 && v <= 1) return String(Math.round(v * 100));
+        return String(Math.round(v));
+    }
+    let s = String(v).replace('%', '').replace(',', '.').trim();
+    if (s === '' || isNaN(parseFloat(s))) return null;
+    let n = parseFloat(s);
+    if (n > 0 && n <= 1) n = n * 100;
+    return String(Math.round(n));
+}
+
+// Reglas de "No Aplica por Área": { "PRODUCTO": ["CR","MDA"] } — se carga desde la base
+let reglasNoAplica = {};
+// Bitácora diaria de la planificación: { "2026-09-25": [ {autor, texto, hora} ] }
+let bitacoraPlanificacion = {};
+
+// ¿Este producto NO aplica al área de este operador? (regla automática por área)
+function noAplicaPorArea(op, curso) {
+    let areas = reglasNoAplica[curso];
+    if (!areas || areas.length === 0) return false;
+    return areas.includes(op.area || "");
+}
+
+// Estado EFECTIVO de un operador en un producto: aplica la regla de área al vuelo,
+// sin pisar el dato guardado. Si el producto no aplica al área → "noaplica".
+function estadoEfectivo(op, curso) {
+    if (noAplicaPorArea(op, curso)) return "noaplica";
+    let info = op.estados && op.estados[curso];
+    return (info && info.estado) ? info.estado : "rojo";
+}
 // ¿Esta persona entra en el filtro de segmento actual?
 function pasaFiltroSegmento(op) {
     // Segmentos que el usuario actual tiene permitido ver
@@ -241,10 +285,14 @@ let chart;
 let chartTopCursos, chartNotas; 
 
 /* -------------------- 🔥 SINCRONIZACIÓN MAESTRA 🔥 -------------------- */
+// bitacoraPlanificacion queda afuera a propósito: este set() sobreescribe todo el nodo
+// con lo que esta pestaña tiene en memoria, y si otra pestaña quedó desincronizada
+// (ej. laptop en reposo) borraba comentarios recién agregados por otros entrenadores.
+// Esa sección se guarda aparte, en su propio path (ver guardarComentarioDiario).
 async function guardarDatos() {
     if (operadores.length > 0) {
         try {
-            await db.ref('GAC_Sistema').set({ mapaCodigos, operadores, sesiones, actividades, historialAuditoria });
+            await db.ref('GAC_Sistema').set({ mapaCodigos, operadores, sesiones, actividades, historialAuditoria, reglasNoAplica });
         } catch (err) {
             console.error('Error al guardar:', err);
             if (err.code === 'PERMISSION_DENIED') {
@@ -286,6 +334,8 @@ function iniciarEscuchaDatos() {
             sesiones = data.sesiones || [];
             actividades = data.actividades || [];
             historialAuditoria = data.historialAuditoria || [];
+            reglasNoAplica = data.reglasNoAplica || {};
+            bitacoraPlanificacion = data.bitacoraPlanificacion || {};
 
             aplicarInterfazLogueada(); 
             crearEncabezado(); 
@@ -347,14 +397,17 @@ async function abrirPanelUsuarios() {
     let filas = Object.entries(usuariosConfig).map(([id, u]) => {
         let estado = u.bloqueado ? '<span style="color:#c0392b;font-weight:bold;">🚫 Bloqueado</span>' : '<span style="color:#27ae60;font-weight:bold;">✅ Activo</span>';
         let panelTag = u.verPanel ? ' <span style="background:#8e44ad;color:white;font-size:10px;padding:1px 6px;border-radius:8px;">📈 Panel</span>' : '';
+        let segs = Array.isArray(u.segmentos) ? u.segmentos.filter(s => s !== 'Operador') : [];
+        let segsTag = segs.length ? ` <span style="color:#555;font-size:10px;">+ ${segs.join(', ')}</span>` : '';
         return `<tr style="border-bottom:1px solid #eee;">
             <td style="padding:8px;text-align:left;font-size:12px;">${u.email}</td>
-            <td style="padding:8px;font-size:12px;">${perfilLabel[u.perfil] || u.perfil}${panelTag}</td>
+            <td style="padding:8px;font-size:12px;">${perfilLabel[u.perfil] || u.perfil}${segsTag}${panelTag}</td>
             <td style="padding:8px;font-size:12px;">${estado}</td>
             <td style="padding:8px;white-space:nowrap;">
                 <button onclick="resetPassUsuario('${u.email}')" title="Restablecer contraseña" style="background:#f39c12;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">🔑</button>
                 <button onclick="toggleBloqueoUsuario('${id}')" title="${u.bloqueado ? 'Desbloquear' : 'Bloquear'}" style="background:${u.bloqueado ? '#27ae60' : '#c0392b'};color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">${u.bloqueado ? '🔓' : '🔒'}</button>
                 <button onclick="cambiarPerfilUsuario('${id}')" title="Editar perfil" style="background:#2980b9;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">✏️</button>
+                <button onclick="eliminarUsuario('${id}')" title="Eliminar usuario" style="background:#7f2d1c;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">🗑️</button>
             </td></tr>`;
     }).join('');
 
@@ -392,7 +445,14 @@ async function crearUsuarioNuevo() {
                     <option value="lectura">Visualización</option>
                     <option value="edicion">Visualización + Edición</option>
                </select>
-               <label style="display:block;margin-top:10px;font-size:14px;text-align:left;padding-left:5%;">
+               <div style="text-align:left;padding:8px 5%;font-size:13px;">
+                    <b>¿Qué segmentos puede ver?</b>
+                    <label style="display:block;margin-top:4px;"><input type="checkbox" checked disabled> Operadores <span style="color:#999;">(siempre)</span></label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Líder"> Líderes</label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Supervisor"> Supervisores</label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Analista"> Analistas</label>
+               </div>
+               <label style="display:block;margin-top:6px;font-size:14px;text-align:left;padding-left:5%;">
                     <input type="checkbox" id="nu-panel"> Ve el Tablero de Jefatura
                </label>`,
         showCancelButton: true, confirmButtonText: 'Crear',
@@ -401,9 +461,10 @@ async function crearUsuarioNuevo() {
             let pass = document.getElementById('nu-pass').value;
             let perfil = document.getElementById('nu-perfil').value;
             let verPanel = document.getElementById('nu-panel').checked;
+            let segmentos = ["Operador", ...Array.from(document.querySelectorAll('.nu-seg:checked')).map(c => c.value)];
             if (!email || !email.includes('@')) { Swal.showValidationMessage('Email inválido'); return false; }
             if (!pass || pass.length < 6) { Swal.showValidationMessage('La contraseña debe tener al menos 6 caracteres'); return false; }
-            return { email, pass, perfil, verPanel };
+            return { email, pass, perfil, verPanel, segmentos };
         }
     });
     if (!form) return;
@@ -415,7 +476,7 @@ async function crearUsuarioNuevo() {
         const cred = await appSec.auth().createUserWithEmailAndPassword(form.email, form.pass);
         const uid = cred.user.uid;
         await db.ref('usuarios_config/' + uid).set({
-            email: form.email, perfil: form.perfil, verPanel: form.verPanel, bloqueado: false,
+            email: form.email, perfil: form.perfil, verPanel: form.verPanel, segmentos: form.segmentos, bloqueado: false,
             creadoPor: usuarioActual, fecha: new Date().toLocaleString('es-AR')
         });
         await appSec.auth().signOut();
@@ -448,6 +509,7 @@ async function toggleBloqueoUsuario(id) {
 // Cambia el perfil (visualización <-> edición) y el acceso al panel de un usuario
 async function cambiarPerfilUsuario(id) {
     let u = usuariosConfig[id]; if (!u) return;
+    let segsActuales = Array.isArray(u.segmentos) ? u.segmentos : [];
     const { value: form } = await Swal.fire({
         title: 'Editar perfil', 
         html: `<p style="font-size:13px;color:#555;margin-bottom:10px;">${u.email}</p>
@@ -455,15 +517,26 @@ async function cambiarPerfilUsuario(id) {
                     <option value="lectura" ${u.perfil === 'lectura' ? 'selected' : ''}>Visualización</option>
                     <option value="edicion" ${u.perfil === 'edicion' ? 'selected' : ''}>Visualización + Edición</option>
                </select>
-               <label style="display:block;margin-top:10px;font-size:14px;text-align:left;padding-left:5%;">
+               <div style="text-align:left;padding:8px 5%;font-size:13px;">
+                    <b>¿Qué segmentos puede ver?</b>
+                    <label style="display:block;margin-top:4px;"><input type="checkbox" checked disabled> Operadores <span style="color:#999;">(siempre)</span></label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Líder" ${segsActuales.includes('Líder') ? 'checked' : ''}> Líderes</label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Supervisor" ${segsActuales.includes('Supervisor') ? 'checked' : ''}> Supervisores</label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Analista" ${segsActuales.includes('Analista') ? 'checked' : ''}> Analistas</label>
+               </div>
+               <label style="display:block;margin-top:6px;font-size:14px;text-align:left;padding-left:5%;">
                     <input type="checkbox" id="ep-panel" ${u.verPanel ? 'checked' : ''}> Ve el Tablero de Jefatura
                </label>`,
         showCancelButton: true, confirmButtonText: 'Guardar',
-        preConfirm: () => ({ perfil: document.getElementById('ep-perfil').value, verPanel: document.getElementById('ep-panel').checked })
+        preConfirm: () => ({
+            perfil: document.getElementById('ep-perfil').value,
+            verPanel: document.getElementById('ep-panel').checked,
+            segmentos: ["Operador", ...Array.from(document.querySelectorAll('.ep-seg:checked')).map(c => c.value)]
+        })
     });
     if (!form) return;
-    await db.ref('usuarios_config/' + id).update({ perfil: form.perfil, verPanel: form.verPanel });
-    registrarAccion(`Cambió el perfil de ${u.email} a ${form.perfil}${form.verPanel ? ' + panel' : ''}`);
+    await db.ref('usuarios_config/' + id).update({ perfil: form.perfil, verPanel: form.verPanel, segmentos: form.segmentos });
+    registrarAccion(`Editó el perfil de ${u.email}: ${form.perfil}, segmentos [${form.segmentos.join(', ')}]${form.verPanel ? ', +panel' : ''}`);
     abrirPanelUsuarios();
 }
 
@@ -484,7 +557,24 @@ async function resetPassUsuario(email) {
     }
 }
 
-// Con lectura abierta, cargamos los datos apenas abre la app (sin esperar login)
+// Elimina un usuario de la lista de configuración (pierde su perfil y acceso en el GIC)
+async function eliminarUsuario(id) {
+    let u = usuariosConfig[id]; if (!u) return;
+    const { isConfirmed } = await Swal.fire({
+        title: '¿Eliminar usuario?',
+        html: `Se quitará a <b>${u.email}</b> de la lista y perderá su acceso al GIC.<br><br><span style="font-size:12px;color:#7f8c8d;">Nota: su cuenta de correo en el sistema de autenticación no se elimina desde acá; queda sin permisos.</span>`,
+        icon: 'warning', showCancelButton: true, confirmButtonColor: '#c0392b',
+        confirmButtonText: 'Sí, eliminar', cancelButtonText: 'Cancelar'
+    });
+    if (!isConfirmed) return;
+    try {
+        await db.ref('usuarios_config/' + id).remove();
+        registrarAccion(`Eliminó al usuario ${u.email} de la configuración`);
+        Swal.fire('Eliminado', `${u.email} fue quitado de la lista.`, 'success').then(() => abrirPanelUsuarios());
+    } catch (e) {
+        Swal.fire('Error', e.message || 'No se pudo eliminar.', 'error');
+    }
+}
 iniciarEscuchaDatos();
 
 /* -------------------- 🗂️ NAVEGACIÓN Y FILTROS -------------------- */
@@ -542,7 +632,7 @@ function cambiarSegmento(valor) {
 }
 function actualizarDashboard(){
     let filtro = document.getElementById("filtroProducto")?.value || "TODOS"; let opsActivos = operadores.filter(op => (mostrarBajas ? op.activo === false : op.activo !== false) && pasaFiltroSegmento(op)); let domTotalOp = document.getElementById("totalOperadores"); if(domTotalOp) domTotalOp.innerText = opsActivos.length; let domTotalCu = document.getElementById("totalCursos"); if(domTotalCu) domTotalCu.innerText = cursos.length;
-    let total = 0, completos = 0, enProceso = 0, pendientes = 0; if (filtro === "TODOS") { opsActivos.forEach(op => { cursos.forEach(c => { let est = op.estados[c]?.estado || "rojo"; if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }); } else { opsActivos.forEach(op => { let est = op.estados[filtro]?.estado || "rojo"; if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }
+    let total = 0, completos = 0, enProceso = 0, pendientes = 0; if (filtro === "TODOS") { opsActivos.forEach(op => { cursos.forEach(c => { let est = estadoEfectivo(op, c); if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }); } else { opsActivos.forEach(op => { let est = estadoEfectivo(op, filtro); if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }
     let domCob = document.getElementById("cobertura"); if(domCob) domCob.innerText = (total > 0 ? Math.round((completos / total) * 100) : 0) + "%"; let ctx = document.getElementById("grafico"); if(ctx) { if(chart) chart.destroy(); chart = new Chart(ctx, { type: "doughnut", data: { labels: ["Capacitados (Verde)", "En proceso (Amarillo)", "Pendientes (Rojo)"], datasets: [{ data: [completos, enProceso, pendientes], backgroundColor: ["#2ecc71", "#f1c40f", "#e74c3c"] }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: filtro === "TODOS" ? "Métricas Generales" : `Métricas de: ${filtro}`, font: { size: 16 } } } } }); }
 }
 
@@ -609,8 +699,7 @@ function actualizarListaPendientes() {
     let opsActivos = operadores.filter(op => op.activo !== false);
     let lista = opsActivos.filter(op => {
         if (segFiltro !== 'TODOS' && segmentoDe(op) !== segFiltro) return false;
-        let info = op.estados && op.estados[producto];
-        let estOp = info && info.estado ? info.estado : 'rojo'; // sin registro = pendiente
+        let estOp = estadoEfectivo(op, producto);
         return estOp === estado;
     });
     lista.sort((a, b) => a.nombre.localeCompare(b.nombre));
@@ -695,8 +784,8 @@ function actualizarTableroJefatura() {
         htmlTabla += `</tr></thead><tbody>`;
 
         cursos.forEach(curso => {
-            let aplicaGlobal = opsActivos.filter(op => (op.estados[curso]?.estado || 'rojo') !== 'noaplica');
-            let capacitadosGlobal = aplicaGlobal.filter(op => op.estados[curso] && op.estados[curso].estado === 'verde').length;
+            let aplicaGlobal = opsActivos.filter(op => estadoEfectivo(op, curso) !== 'noaplica');
+            let capacitadosGlobal = aplicaGlobal.filter(op => estadoEfectivo(op, curso) === 'verde').length;
             let totalGlobal = aplicaGlobal.length;
             let percGlobal = totalGlobal > 0 ? Math.round((capacitadosGlobal / totalGlobal) * 100) : 0;
             let colorGlobal = percGlobal >= 85 ? '#27ae60' : (percGlobal >= 70 ? '#f39c12' : '#c0392b');
@@ -704,9 +793,9 @@ function actualizarTableroJefatura() {
             htmlTabla += `<tr style="border-bottom: 1px solid #ecf0f1; transition: background 0.2s;" onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background='transparent'"><td style="padding: 10px; text-align: left; font-weight: bold; color: #34495e; border-right: 1px solid #ecf0f1;">${curso}</td><td style="padding: 10px; font-weight: bold; color: ${colorGlobal}; background: #fdfefe; border-right: 1px solid #ecf0f1;">${percGlobal}% <br><span style="font-size:10px; color:#7f8c8d;">(${capacitadosGlobal}/${totalGlobal} ops)</span></td>`;
 
             areas.forEach(area => {
-                let opsArea = opsActivos.filter(op => (op.area || 'Sin Asignar') === area && (op.estados[curso]?.estado || 'rojo') !== 'noaplica');
+                let opsArea = opsActivos.filter(op => (op.area || 'Sin Asignar') === area && estadoEfectivo(op, curso) !== 'noaplica');
                 let totalArea = opsArea.length;
-                let capacitadosArea = opsArea.filter(op => op.estados[curso] && op.estados[curso].estado === 'verde').length;
+                let capacitadosArea = opsArea.filter(op => estadoEfectivo(op, curso) === 'verde').length;
                 let percArea = totalArea > 0 ? Math.round((capacitadosArea / totalArea) * 100) : 0;
                 let colorArea = percArea >= 85 ? '#27ae60' : (percArea >= 70 ? '#f39c12' : '#c0392b');
                 htmlTabla += `<td style="padding: 10px; color: ${colorArea}; font-weight: bold;">${percArea}% <br><span style="font-size:10px; color:#7f8c8d;">(${capacitadosArea}/${totalArea} ops)</span></td>`;
@@ -845,8 +934,10 @@ function crearTabla(){
 
         cursos.forEach(curso => {
             let info = op.estados[curso] || { estado: "rojo", historial: [] }; if (!info.historial) info.historial = []; let lineasInfo = [];
+            // Estado de VISTA: si el producto no aplica al área del operador, se muestra N/A (regla automática)
+            let estadoVista = noAplicaPorArea(op, curso) ? "noaplica" : info.estado;
 
-            if (info.historial.length > 0) { 
+            if (estadoVista !== "noaplica" && info.historial.length > 0) { 
                 info.historial.forEach(evento => { 
                     let fechaVisual = "";
                     if(evento.fecha){ let partes = evento.fecha.split(' '); let soloFecha = partes[0]; let soloHora = partes[1] ? ` ${partes[1]} hs` : ""; fechaVisual = soloFecha.split('-').reverse().join('/') + soloHora; }
@@ -862,13 +953,13 @@ function crearTabla(){
                     }
                     lineasInfo.push(txt); 
                 }); 
-            } else if (info.estado === "amarillo") { lineasInfo.push("<i>En capacitación</i>"); }
-            else if (info.estado === "noaplica") { lineasInfo.push("<i>No aplica a este operador</i>"); }
+            } else if (estadoVista === "amarillo") { lineasInfo.push("<i>En capacitación</i>"); }
+            else if (estadoVista === "noaplica") { lineasInfo.push("<i>No aplica a este grupo</i>"); }
             
             let clickCelda = (modoEdicion && !mostrarBajas) ? `onclick="cargarCapacitacion('${op.nombre}', '${curso}')"` : `style="cursor: default;"`;
-            let contenidoCelda = info.estado === "noaplica"
+            let contenidoCelda = estadoVista === "noaplica"
                 ? `<span style="display:inline-block;background:#bdc3c7;color:#555;font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;">N/A</span>`
-                : `<span class="estado ${info.estado}"></span>`;
+                : `<span class="estado ${estadoVista}"></span>`;
             fila += `<td ${clickCelda}>${contenidoCelda}<div class="miniInfo">${lineasInfo.join("<hr style='margin: 4px 0; border: 0; border-top: 1px dashed #ccc;'>")}</div></td>`;
         });
         fila += "</tr>"; fragmento += fila;
@@ -1022,7 +1113,45 @@ if(buscador) { buscador.addEventListener("input", function(){ let texto = this.v
 
 async function agregarProducto() { const { value: formValues } = await Swal.fire({ title: 'Nuevo Producto', html: '<input id="swal-input1" class="swal2-input" placeholder="Nombre">' + '<input id="swal-input2" class="swal2-input" placeholder="Código">', focusConfirm: false, showCancelButton: true, preConfirm: () => { return { producto: document.getElementById('swal-input1').value.trim().toUpperCase(), codigo: document.getElementById('swal-input2').value.trim().toUpperCase() }; } }); if (formValues && formValues.producto) { mapaCodigos[formValues.codigo] = formValues.producto; registrarAccion(`Creó un nuevo producto: ${formValues.producto}`); guardarDatos(); } }
 
-async function gestionarProductos() { const { value: accion } = await Swal.fire({ title: 'Gestión', input: 'select', inputOptions: { 'eliminar': 'Eliminar Código', 'renombrar': 'Renombrar Producto' }, showCancelButton: true }); if (accion === 'eliminar') { const { value: codigo } = await Swal.fire({ title: 'Código', input: 'select', inputOptions: mapaCodigos, showCancelButton: true }); if (codigo) { registrarAccion(`Eliminó el código ${codigo} (${mapaCodigos[codigo]})`); delete mapaCodigos[codigo]; guardarDatos(); } } else if (accion === 'renombrar') { let opciones = {}; cursos.forEach(p => opciones[p] = p); const { value: viejo } = await Swal.fire({ title: 'Renombrar', input: 'select', inputOptions: opciones, showCancelButton: true }); if (viejo) { const { value: nuevo } = await Swal.fire({ title: `Nuevo nombre para ${viejo}`, input: 'text', showCancelButton: true }); if (nuevo) { let n = nuevo.trim().toUpperCase(); for (let code in mapaCodigos) { if (mapaCodigos[code] === viejo) mapaCodigos[code] = n; } operadores.forEach(op => { if (op.estados[viejo]) { op.estados[n] = op.estados[viejo]; delete op.estados[viejo]; } }); registrarAccion(`Renombró el producto ${viejo} a ${n}`); guardarDatos(); } } } }
+// Configura qué áreas (MDA/CR) NO aplican a cada producto
+async function configurarNoAplicaPorArea() {
+    // Áreas existentes en los operadores + las típicas
+    let areasSet = new Set(["MDA", "CR"]);
+    operadores.forEach(op => { if (op.area) areasSet.add(op.area); });
+    let areas = [...areasSet];
+
+    // Elegir producto
+    let opcProd = {}; cursos.slice().sort().forEach(c => opcProd[c] = c);
+    const { value: producto } = await Swal.fire({
+        title: '🚫 No Aplica por Área',
+        text: 'Elegí el producto a configurar',
+        input: 'select', inputOptions: opcProd, showCancelButton: true, confirmButtonText: 'Siguiente'
+    });
+    if (!producto) return;
+
+    let actuales = reglasNoAplica[producto] || [];
+    let checks = areas.map(a => `<label style="display:block;text-align:left;padding:6px 20px;font-size:15px;">
+        <input type="checkbox" class="na-area" value="${a}" ${actuales.includes(a) ? 'checked' : ''}> No aplica a <b>${a}</b>
+    </label>`).join('');
+
+    const { isConfirmed, value: sel } = await Swal.fire({
+        title: `${producto}`,
+        html: `<p style="font-size:13px;color:#555;">Tildá las áreas a las que <b>NO</b> corresponde este producto. Los operadores de esas áreas lo verán como "N/A" y saldrá de su cobertura.</p>${checks}`,
+        showCancelButton: true, confirmButtonText: 'Guardar',
+        preConfirm: () => Array.from(document.querySelectorAll('.na-area:checked')).map(c => c.value)
+    });
+    if (!isConfirmed) return;
+
+    // Guardamos: si no hay ninguna, borramos la regla del producto
+    if (!sel || sel.length === 0) delete reglasNoAplica[producto];
+    else reglasNoAplica[producto] = sel;
+
+    registrarAccion(`Configuró "No Aplica" de ${producto}: ${(sel && sel.length) ? sel.join(', ') : 'ninguna área'}`);
+    guardarDatos(); crearTabla(); actualizarDashboard();
+    Swal.fire('Guardado', `Regla de "${producto}" actualizada.`, 'success');
+}
+
+async function gestionarProductos() { const { value: accion } = await Swal.fire({ title: 'Gestión', input: 'select', inputOptions: { 'eliminar': 'Eliminar Código', 'renombrar': 'Renombrar Producto', 'noaplica': '🚫 Configurar "No Aplica" por Área' }, showCancelButton: true }); if (accion === 'noaplica') { await configurarNoAplicaPorArea(); return; } if (accion === 'eliminar') { const { value: codigo } = await Swal.fire({ title: 'Código', input: 'select', inputOptions: mapaCodigos, showCancelButton: true }); if (codigo) { registrarAccion(`Eliminó el código ${codigo} (${mapaCodigos[codigo]})`); delete mapaCodigos[codigo]; guardarDatos(); } } else if (accion === 'renombrar') { let opciones = {}; cursos.forEach(p => opciones[p] = p); const { value: viejo } = await Swal.fire({ title: 'Renombrar', input: 'select', inputOptions: opciones, showCancelButton: true }); if (viejo) { const { value: nuevo } = await Swal.fire({ title: `Nuevo nombre para ${viejo}`, input: 'text', showCancelButton: true }); if (nuevo) { let n = nuevo.trim().toUpperCase(); for (let code in mapaCodigos) { if (mapaCodigos[code] === viejo) mapaCodigos[code] = n; } operadores.forEach(op => { if (op.estados[viejo]) { op.estados[n] = op.estados[viejo]; delete op.estados[viejo]; } }); registrarAccion(`Renombró el producto ${viejo} a ${n}`); guardarDatos(); } } } }
 
 function verReporteCursos() { let reporte = []; let opsActivos = operadores.filter(op => op.activo !== false); cursos.forEach(curso => { let completados = 0; opsActivos.forEach(op => { if (op.estados[curso] && op.estados[curso].estado === "verde") completados++; }); reporte.push({ nombre: curso, cantidad: completados }); }); reporte.sort((a, b) => b.cantidad - a.cantidad); let htmlTabla = `<table style="width:100%; border-collapse:collapse; font-size:14px; text-align:left;"><tr style="background:#f2f2f2; border-bottom:2px solid #ccc;"><th style="padding:8px;">Producto</th><th style="padding:8px; text-align:center;">Capacitados (Activos)</th></tr>`; reporte.forEach(r => { htmlTabla += `<tr style="border-bottom:1px solid #eee;"><td style="padding:8px;">${r.nombre}</td><td style="padding:8px; text-align:center; font-weight:bold; color:${r.cantidad > 0 ? '#2ecc71' : '#e74c3c'}">${r.cantidad}</td></tr>`; }); htmlTabla += `</table>`; Swal.fire({ title: 'Reporte: Capacitados por Producto', html: `<div style="max-height: 400px; overflow-y: auto;">${htmlTabla}</div>`, width: '700px', confirmButtonColor: '#8e44ad', confirmButtonText: 'Cerrar reporte' }); }
 
@@ -1033,11 +1162,11 @@ function accederManuales() { const RUTA_MANUALES = "\\\\central\\GDS\\Proyectos 
 /* -------------------- 📊 LIBRETA VIRTUAL Y ESTADÍSTICAS INDIVIDUALES -------------------- */
 function verEstadisticas(nombre) {
     let op = operadores.find(o => o.nombre === nombre); if(!op) return; let completados = []; let enProceso = []; let faltantes = []; let noAplica = [];
-    cursos.forEach(c => { let est = op.estados && op.estados[c]?.estado || "rojo"; if (est === "verde") completados.push(c); else if (est === "amarillo") enProceso.push(c); else if (est === "noaplica") noAplica.push(c); else faltantes.push(c); }); let baseCursos = cursos.length - noAplica.length; let porcentaje = baseCursos > 0 ? Math.round((completados.length / baseCursos) * 100) : 0; let areaBadge = op.area ? `| Área: <b>${op.area}</b>` : ""; let estadoBadge = op.activo === false ? `<br><span style="color:#e74c3c; font-size:14px;">[Operador Inactivo / Archivado]</span>` : '';
+    cursos.forEach(c => { let est = estadoEfectivo(op, c); if (est === "verde") completados.push(c); else if (est === "amarillo") enProceso.push(c); else if (est === "noaplica") noAplica.push(c); else faltantes.push(c); }); let baseCursos = cursos.length - noAplica.length; let porcentaje = baseCursos > 0 ? Math.round((completados.length / baseCursos) * 100) : 0; let areaBadge = op.area ? `| Área: <b>${op.area}</b>` : ""; let estadoBadge = op.activo === false ? `<br><span style="color:#e74c3c; font-size:14px;">[Operador Inactivo / Archivado]</span>` : '';
     
     let botonInforme = modoEdicion ? `<button onclick="emitirActaRefuerzo('${nombre}')" style="padding: 8px 15px; background-color: #1f497d; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-top: 10px;"><i class="fa-solid fa-file-excel"></i> Descargar Informe Oficial (Excel)</button>` : `<button onclick="emitirActaRefuerzo('${nombre}')" style="padding: 8px 15px; background-color: #8e44ad; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-top: 10px;"><i class="fa-solid fa-file-pdf"></i> Descargar Informe Específico (PDF)</button>`;
 
-    let htmlContent = `<div style="text-align: left; font-size: 14px;"><h2 style="text-align:center; color: #2ecc71;">Completitud: ${porcentaje}% ${areaBadge} ${estadoBadge}</h2><div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px dashed #bdc3c7;"><button onclick="copiarRutaCarpeta('${nombre}')" style="padding: 8px 15px; background-color: #34495e; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-bottom: 10px;"><i class="fa-regular fa-copy"></i> Copiar Ruta de Exámenes en Red</button><button onclick="descargarBoletinPDF('${nombre}')" style="padding: 8px 15px; background-color: #c0392b; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s;"><i class="fa-solid fa-file-pdf"></i> Descargar Libreta PDF General</button>${botonInforme}</div><hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;"><h4 style="color:#2ecc71; margin-bottom: 5px;">✅ Completados (${completados.length}):</h4><p style="font-size:12px; margin-top: 0;">${completados.join(' | ') || 'Ninguno'}</p><h4 style="color:#f1c40f; margin-bottom: 5px;">⏳ En Proceso (${enProceso.length}):</h4><p style="font-size:12px; margin-top: 0;">${enProceso.join(' | ') || 'Ninguno'}</p><h4 style="color:#e74c3c; margin-bottom: 5px;">❌ No aplica (${faltantes.length}):</h4><p style="font-size:12px; margin-top: 0;">${faltantes.join(' | ') || 'Ninguno'}</p></div>`;
+    let htmlContent = `<div style="text-align: left; font-size: 14px;"><h2 style="text-align:center; color: #2ecc71;">Completitud: ${porcentaje}% ${areaBadge} ${estadoBadge}</h2><div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px dashed #bdc3c7;"><button onclick="copiarRutaCarpeta('${nombre}')" style="padding: 8px 15px; background-color: #34495e; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-bottom: 10px;"><i class="fa-regular fa-copy"></i> Copiar Ruta de Exámenes en Red</button><button onclick="descargarBoletinPDF('${nombre}')" style="padding: 8px 15px; background-color: #c0392b; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s;"><i class="fa-solid fa-file-pdf"></i> Descargar Libreta PDF General</button>${botonInforme}</div><hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;"><h4 style="color:#2ecc71; margin-bottom: 5px;">✅ Completados (${completados.length}):</h4><p style="font-size:12px; margin-top: 0;">${completados.join(' | ') || 'Ninguno'}</p><h4 style="color:#f1c40f; margin-bottom: 5px;">⏳ En Proceso (${enProceso.length}):</h4><p style="font-size:12px; margin-top: 0;">${enProceso.join(' | ') || 'Ninguno'}</p><h4 style="color:#e74c3c; margin-bottom: 5px;">❌ N/A para su grupo de tratamiento (${faltantes.length}):</h4><p style="font-size:12px; margin-top: 0;">${faltantes.join(' | ') || 'Ninguno'}</p>${noAplica.length > 0 ? `<h4 style="color:#7f8c8d; margin-bottom: 5px;">🚫 No Aplica (${noAplica.length}):</h4><p style="font-size:12px; margin-top: 0;">${noAplica.join(' | ')}</p>` : ''}</div>`; 
     Swal.fire({ title: `Estadísticas: ${nombre}`, html: htmlContent, icon: 'info', width: '700px', showConfirmButton: false, showCloseButton: true });
 }
 
@@ -1195,23 +1324,47 @@ function exportarConvocadosExcel(idSesion) {
         pendiente: 'Pendiente', presente: 'Presente', ausente: 'Ausente',
         licencia: 'Licencia', capacitado: 'Evaluado'
     };
-    // Encabezado + filas: Nombre | Producto | Estado | Fecha de deslogueo | Comentarios
-    let aoa = [['Operador', 'Producto', 'Estado', 'Fecha de deslogueo', 'Comentarios']];
-    sesion.convocados.forEach(conv => {
-        let est = conv.estado ? (mapaEstado[conv.estado.toLowerCase()] || conv.estado) : 'Pendiente';
-        aoa.push([conv.nombre, productos, est, '', '']);
+    // Mapa nombre → área (desde los operadores cargados)
+    let areaDe = (nombre) => { let op = operadores.find(o => o.nombre === nombre); return (op && op.area) ? op.area : 'Sin área'; };
+
+    // Encabezado + filas: Operador | Área | Producto | Estado | Fecha de deslogueo | Comentarios
+    let aoa = [['Operador', 'Área', 'Producto', 'Estado', 'Fecha de deslogueo', 'Comentarios']];
+
+    // Agrupar convocados por área (ordenados: CR, MDA, luego el resto)
+    let convocadosConArea = sesion.convocados.map(conv => ({ ...conv, area: areaDe(conv.nombre) }));
+    let ordenAreas = ["CR", "MDA"];
+    let areasPresentes = [...new Set(convocadosConArea.map(c => c.area))]
+        .sort((a, b) => {
+            let ia = ordenAreas.indexOf(a); let ib = ordenAreas.indexOf(b);
+            if (ia === -1 && ib === -1) return a.localeCompare(b);
+            if (ia === -1) return 1; if (ib === -1) return -1;
+            return ia - ib;
+        });
+
+    areasPresentes.forEach(area => {
+        let delArea = convocadosConArea
+            .filter(c => c.area === area)
+            .sort((a, b) => a.nombre.localeCompare(b.nombre));
+        delArea.forEach(conv => {
+            let est = conv.estado ? (mapaEstado[conv.estado.toLowerCase()] || conv.estado) : 'Pendiente';
+            aoa.push([conv.nombre, area, productos, est, '', '']);
+        });
+        // Subtotal por área
+        let evalArea = delArea.filter(c => (c.estado || '').toLowerCase() === 'capacitado').length;
+        aoa.push([`Subtotal ${area}`, `${delArea.length} operador(es)`, '', `${evalArea} evaluado(s)`, '', '']);
+        aoa.push([]); // fila en blanco separadora
     });
-    // Fila de conteo al pie
+
+    // Fila de conteo general al pie
     let total = sesion.convocados.length;
     let evaluados = sesion.convocados.filter(c => (c.estado || '').toLowerCase() === 'capacitado').length;
     let pendientes = total - evaluados;
-    aoa.push([]);
-    aoa.push(['TOTAL', total, '', '', '']);
-    aoa.push(['Evaluados', evaluados, '', '', '']);
-    aoa.push(['Pendientes de evaluar', pendientes, '', '', '']);
+    aoa.push(['TOTAL GENERAL', total, '', '', '', '']);
+    aoa.push(['Evaluados', evaluados, '', '', '', '']);
+    aoa.push(['Pendientes de evaluar', pendientes, '', '', '', '']);
 
     let ws = XLSX.utils.aoa_to_sheet(aoa);
-    ws['!cols'] = [{ wch: 32 }, { wch: 30 }, { wch: 16 }, { wch: 18 }, { wch: 40 }];
+    ws['!cols'] = [{ wch: 32 }, { wch: 12 }, { wch: 30 }, { wch: 16 }, { wch: 18 }, { wch: 40 }];
     let wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'A evaluar');
     let nombreArchivo = `Convocados_${productos.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)}_${sesion.tipo || ''}.xlsx`;
@@ -1410,6 +1563,77 @@ function renderizarSesiones() {
 }
 
 
+/* -------------------- 📓 BITÁCORA DIARIA DE PLANIFICACIÓN -------------------- */
+async function abrirBitacoraDiaria() {
+    if (!modoEdicion) return;
+    // Fecha de hoy en formato YYYY-MM-DD
+    let hoy = new Date().toISOString().split('T')[0];
+
+    // Armar el historial de días (más reciente primero)
+    let dias = Object.keys(bitacoraPlanificacion).sort().reverse();
+    let htmlDias = dias.map(dia => {
+        let fechaVisual = dia.split('-').reverse().join('/');
+        let comentarios = (bitacoraPlanificacion[dia] || []).map((c, i) => `
+            <div style="background:white; border-left:4px solid #f39c12; padding:8px 10px; margin-bottom:8px; text-align:left; border-radius:4px; position:relative;">
+                <strong style="color:#2c3e50; font-size:13px;">🧑‍🏫 ${c.autor}</strong>
+                <span style="color:#7f8c8d; font-size:11px; float:right;">${c.hora || ''}</span>
+                <button onclick="Swal.close(); setTimeout(()=>eliminarComentarioDiario('${dia}', ${i}),300)" style="background:none;border:none;color:#e74c3c;cursor:pointer;float:right;margin-right:8px;font-size:12px;" title="Eliminar">🗑️</button>
+                <p style="margin:6px 0 0 0; color:#444; font-size:13px;">${c.texto}</p>
+            </div>`).join('');
+        return `<div style="margin-bottom:15px;">
+            <div style="font-weight:bold; color:#1f497d; font-size:14px; border-bottom:2px solid #eee; padding-bottom:4px; margin-bottom:8px;">📅 ${fechaVisual}</div>
+            ${comentarios || '<p style="color:#999; font-size:12px;">Sin comentarios.</p>'}
+        </div>`;
+    }).join('');
+    if (!htmlDias) htmlDias = '<p style="color:#999; text-align:center;">Todavía no hay comentarios en la bitácora.</p>';
+
+    // Autores
+    let autores = ["Solange Mieres", "Hernán Caraballo", "Julia Bandin"];
+    let opcAutores = autores.map(a => `<option value="${a}">${a}</option>`).join('');
+
+    await Swal.fire({
+        title: '📓 Bitácora Diaria de Planificación',
+        width: '650px',
+        html: `
+            <div style="background:#f8f9fa; padding:12px; border-radius:6px; border:1px dashed #ccc; margin-bottom:15px; text-align:left;">
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">Fecha:</label>
+                <input type="date" id="bd-fecha" class="swal2-input" style="margin:5px 0; width:100%;" value="${hoy}">
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">¿Quién comenta?</label>
+                <select id="bd-autor" class="swal2-select" style="width:100%; margin:5px 0; padding:6px;">${opcAutores}</select>
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">Comentario del día:</label>
+                <textarea id="bd-texto" class="swal2-textarea" style="width:100%; margin:5px 0 0 0; height:70px;" placeholder="Ej: Hoy se coordinó con Sistemas la carga de..."></textarea>
+                <button onclick="guardarComentarioDiario()" style="margin-top:8px; background:#27ae60; color:white; border:none; padding:8px 16px; border-radius:5px; font-weight:bold; cursor:pointer;">💾 Agregar comentario</button>
+            </div>
+            <div style="max-height:300px; overflow-y:auto; text-align:left; background:#ecf0f1; padding:12px; border-radius:6px;">${htmlDias}</div>`,
+        showConfirmButton: true, confirmButtonText: 'Cerrar', confirmButtonColor: '#7f8c8d'
+    });
+}
+
+async function guardarComentarioDiario() {
+    let fecha = document.getElementById('bd-fecha').value;
+    let autor = document.getElementById('bd-autor').value;
+    let texto = document.getElementById('bd-texto').value.trim();
+    if (!fecha || !texto) { Swal.showValidationMessage('Completá la fecha y el comentario'); return; }
+    if (!bitacoraPlanificacion[fecha]) bitacoraPlanificacion[fecha] = [];
+    let hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+    bitacoraPlanificacion[fecha].push({ autor, texto, hora });
+    registrarAccion(`Agregó comentario en bitácora diaria (${fecha})`);
+    await db.ref('GAC_Sistema/bitacoraPlanificacion').set(bitacoraPlanificacion);
+    abrirBitacoraDiaria(); // refrescar
+}
+
+async function eliminarComentarioDiario(dia, index) {
+    const { isConfirmed } = await Swal.fire({ title: '¿Eliminar comentario?', icon: 'warning', showCancelButton: true, confirmButtonColor: '#e74c3c', confirmButtonText: 'Eliminar' });
+    if (!isConfirmed) { abrirBitacoraDiaria(); return; }
+    if (bitacoraPlanificacion[dia]) {
+        bitacoraPlanificacion[dia].splice(index, 1);
+        if (bitacoraPlanificacion[dia].length === 0) delete bitacoraPlanificacion[dia];
+        registrarAccion(`Eliminó comentario de bitácora diaria (${dia})`);
+        await db.ref('GAC_Sistema/bitacoraPlanificacion').set(bitacoraPlanificacion);
+    }
+    abrirBitacoraDiaria();
+}
+
 /* -------------------- 📔 BITÁCORA DE ENTRENADORES (NOMBRES Y EDICIÓN) -------------------- */
 async function abrirBitacora(idSesion) {
     if (!modoEdicion) return; let sesion = sesiones.find(s => s.id.toString() === idSesion.toString()); if (!sesion) return; if (!sesion.notas) sesion.notas = [];
@@ -1449,7 +1673,7 @@ async function volcarNotasParciales(idSesion) {
     
     let htmlNotas = presentes.map(nombre => { 
         let idLimpio = nombre.replace(/\s+/g, ''); 
-        return `<div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; text-align: left; border: 1px solid #dee2e6;"><label style="font-weight:bold; font-size:14px; color:#2980b9;">${nombre}</label><div style="display: flex; gap: 10px; align-items: center; margin-top:5px;"><div style="flex: 1.5;" title="Fecha de Carga"><input type="date" id="fecha-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${fechaHoy}"></div><div style="flex: 1;"><input type="time" id="hora-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${horaAhora}"></div><div style="flex: 1.2; display: flex; align-items: center; gap: 8px;"><input type="number" id="nota-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" min="0" max="100" placeholder="Nota %"><label style="font-size: 11px; font-weight:bold; color:#7f8c8d; cursor:pointer; display:flex; align-items:center; gap:3px;" title="Sin evaluación usa la Fecha de Fin del curso"><input type="checkbox" id="na-${idLimpio}" onchange="let n = document.getElementById('nota-${idLimpio}'); let f = document.getElementById('fecha-${idLimpio}'); n.disabled = this.checked; if(this.checked){ n.value = ''; f.disabled = true; f.value = '${fechaFinSesion}'; } else { f.disabled = false; f.value = '${fechaHoy}'; }"> N/A</label></div></div><textarea id="obs-${idLimpio}" class="swal2-textarea" style="width:100%; margin: 5px 0 0 0; padding:8px; font-size: 13px; border: 1px dashed #bdc3c7; resize:vertical; box-sizing:border-box;" rows="3" placeholder="Observaciones / Temas a reforzar (Usá ENTER para bajar de línea)"></textarea></div>` 
+        return `<div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; text-align: left; border: 1px solid #dee2e6;"><label style="font-weight:bold; font-size:14px; color:#2980b9;">${nombre}</label><div style="display: flex; gap: 10px; align-items: center; margin-top:5px;"><div style="flex: 1.5;" title="Fecha de Carga"><input type="date" id="fecha-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${fechaHoy}"></div><div style="flex: 1;"><input type="time" id="hora-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${horaAhora}"></div><div style="flex: 1.2; display: flex; align-items: center; gap: 8px;"><input type="number" id="nota-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" min="0" max="100" placeholder="Nota %"><label style="font-size: 11px; font-weight:bold; color:#7f8c8d; cursor:pointer; display:flex; align-items:center; gap:3px;" title="Sin evaluación usa la Fecha de Fin del curso"><input type="checkbox" id="na-${idLimpio}" onchange="let n = document.getElementById('nota-${idLimpio}'); n.disabled = this.checked; if(this.checked){ n.value = ''; }"> N/A</label></div></div><textarea id="obs-${idLimpio}" class="swal2-textarea" style="width:100%; margin: 5px 0 0 0; padding:8px; font-size: 13px; border: 1px dashed #bdc3c7; resize:vertical; box-sizing:border-box;" rows="3" placeholder="Observaciones / Temas a reforzar (Usá ENTER para bajar de línea)"></textarea></div>` 
     }).join('');
         
     const { value: datosGuardados } = await Swal.fire({ 
@@ -1744,13 +1968,13 @@ async function editarSesion(id) {
 
     const { value: formValues } = await Swal.fire({
         title: 'Editar Requerimiento',
-        html: `<div style="display:flex; gap:15px; margin-bottom: 15px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Tipo:</label><select id="swal-tipo-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="CE" ${sesion.tipo === 'CE' ? 'selected' : ''}>CE</option><option value="CR" ${sesion.tipo === 'CR' ? 'selected' : ''}>CR</option><option value="EI" ${sesion.tipo === 'EI' ? 'selected' : ''}>EI</option><option value="VA" ${sesion.tipo === 'VA' ? 'selected' : ''}>VA</option><option value="VRS" ${sesion.tipo === 'VRS' ? 'selected' : ''}>VRS</option></select></div><div style="flex:2; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Entrenador/a:</label><select id="swal-entrenador-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="Solange Mieres" ${sesion.entrenador === 'Solange Mieres' ? 'selected' : ''}>Solange Mieres</option><option value="Hernán Caraballo" ${sesion.entrenador === 'Hernán Caraballo' ? 'selected' : ''}>Hernán Caraballo</option><option value="Julia Bandin" ${sesion.entrenador === 'Julia Bandin' ? 'selected' : ''}>Julia Bandin</option><option value="Julia Bandin / Hernán Caraballo" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo</option><option value="Julia Bandin / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Solange Mieres</option><option value="Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Hernán Caraballo / Solange Mieres</option><option value="Julia Bandin / Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo / Solange Mieres</option></select></div></div><label style="font-size:12px; font-weight:bold; display:block; text-align:left; margin-bottom:3px;">Producto/s:</label><div style="max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff; margin-bottom: 15px; display: block;">${checkboxesProductos}</div><div style="display:flex; gap:10px; margin-bottom: 10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Inicio:</label><input type="date" id="swal-fecha-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Fin:</label><input type="date" id="swal-fecha-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaFin || ''}"></div></div><div style="display:flex; gap:10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Inicio:</label><input type="time" id="swal-hora-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Fin:</label><input type="time" id="swal-hora-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaFin || ''}"></div></div><label style="font-size:12px; font-weight:bold; margin-top:10px; display:block; text-align:left;">Convocados:</label><div style="max-height: 120px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff;">${opsHtml}</div>`,
+        html: `<div style="display:flex; gap:15px; margin-bottom: 15px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Tipo:</label><select id="swal-tipo-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="CE" ${sesion.tipo === 'CE' ? 'selected' : ''}>CE</option><option value="CR" ${sesion.tipo === 'CR' ? 'selected' : ''}>CR</option><option value="EI" ${sesion.tipo === 'EI' ? 'selected' : ''}>EI</option><option value="VA" ${sesion.tipo === 'VA' ? 'selected' : ''}>VA</option><option value="VRS" ${sesion.tipo === 'VRS' ? 'selected' : ''}>VRS</option></select></div><div style="flex:2; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Entrenador/a:</label><select id="swal-entrenador-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="Solange Mieres" ${sesion.entrenador === 'Solange Mieres' ? 'selected' : ''}>Solange Mieres</option><option value="Hernán Caraballo" ${sesion.entrenador === 'Hernán Caraballo' ? 'selected' : ''}>Hernán Caraballo</option><option value="Julia Bandin" ${sesion.entrenador === 'Julia Bandin' ? 'selected' : ''}>Julia Bandin</option><option value="Julia Bandin / Hernán Caraballo" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo</option><option value="Julia Bandin / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Solange Mieres</option><option value="Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Hernán Caraballo / Solange Mieres</option><option value="Julia Bandin / Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo / Solange Mieres</option></select></div></div><label style="font-size:12px; font-weight:bold; display:block; text-align:left; margin-bottom:3px;">Producto/s:</label><div style="max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff; margin-bottom: 15px; display: block;">${checkboxesProductos}</div><div style="display:flex; gap:10px; margin-bottom: 10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Inicio:</label><input type="date" id="swal-fecha-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Fin:</label><input type="date" id="swal-fecha-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaFin || ''}"></div></div><div style="display:flex; gap:10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Inicio:</label><input type="time" id="swal-hora-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Fin:</label><input type="time" id="swal-hora-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaFin || ''}"></div></div><hr style="margin: 15px 0;"><label style="font-size:12px; font-weight:bold; display:block; text-align:left;"><i class="fa-solid fa-link"></i> Enlaces Útiles (Opcionales):</label><input id="swal-link-verif-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="🔗 Link de Verificación" value="${(sesion.linkVerificacion || '').replace(/"/g, '&quot;')}"><input id="swal-link-kahoot-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="🎮 Link de Kahoot" value="${(sesion.linkKahoot || '').replace(/"/g, '&quot;')}"><input id="swal-link-encuesta-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="⭐ Link de Encuesta Satisfacción" value="${(sesion.linkEncuesta || '').replace(/"/g, '&quot;')}"><label style="font-size:12px; font-weight:bold; margin-top:10px; display:block; text-align:left;">Convocados:</label><div style="max-height: 120px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff;">${opsHtml}</div>`,
         width: '650px', showCancelButton: true, confirmButtonText: 'Guardar Cambios',
         preConfirm: () => {
             let cursosSeleccionados = Array.from(document.querySelectorAll('.chk-producto-multi-edit:checked')).map(cb => cb.value);
             let convocadosNuevos = Array.from(document.querySelectorAll('.chk-convocado-edit:checked')).map(cb => { let yaEstaba = sesion.convocados.find(c => c.nombre === cb.value); return yaEstaba ? yaEstaba : { nombre: cb.value, estado: "pendiente" }; });
             if (cursosSeleccionados.length === 0 || convocadosNuevos.length === 0) { Swal.showValidationMessage('Elegí al menos un producto y un convocado.'); return false; }
-            sesion.tipo = document.getElementById('swal-tipo-edit').value; sesion.entrenador = document.getElementById('swal-entrenador-edit').value; sesion.cursos = cursosSeleccionados; delete sesion.curso; sesion.fechaInicio = document.getElementById('swal-fecha-inicio-edit').value; sesion.fechaFin = document.getElementById('swal-fecha-fin-edit').value; sesion.horaInicio = document.getElementById('swal-hora-inicio-edit').value; sesion.horaFin = document.getElementById('swal-hora-fin-edit').value; sesion.convocados = convocadosNuevos; return true;
+            sesion.tipo = document.getElementById('swal-tipo-edit').value; sesion.entrenador = document.getElementById('swal-entrenador-edit').value; sesion.cursos = cursosSeleccionados; delete sesion.curso; sesion.fechaInicio = document.getElementById('swal-fecha-inicio-edit').value; sesion.fechaFin = document.getElementById('swal-fecha-fin-edit').value; sesion.horaInicio = document.getElementById('swal-hora-inicio-edit').value; sesion.horaFin = document.getElementById('swal-hora-fin-edit').value; sesion.linkVerificacion = document.getElementById('swal-link-verif-edit').value; sesion.linkKahoot = document.getElementById('swal-link-kahoot-edit').value; sesion.linkEncuesta = document.getElementById('swal-link-encuesta-edit').value; sesion.convocados = convocadosNuevos; return true;
         }
     });
 
@@ -2395,20 +2619,6 @@ async function importarEvaluacionesSurveyMonkey() {
     //  - Celda con formato %  → xlsx devuelve fracción (0.85)  → 85
     //  - Texto "85%" / "85,5" → 85 / 85.5
     //  - Kahoot (>100 pts)     → se deja tal cual
-    const normScore = (v) => {
-        if (v === null || v === undefined || v === '') return null;
-        if (typeof v === 'number') {
-            // fracción de porcentaje (0 < v <= 1) → pasar a escala 0-100
-            if (v > 0 && v <= 1) return String(Math.round(v * 100));
-            return String(Math.round(v));
-        }
-        let s = String(v).replace('%', '').replace(',', '.').trim();
-        if (s === '' || isNaN(parseFloat(s))) return null;
-        let n = parseFloat(s);
-        if (n > 0 && n <= 1) n = n * 100; // por si vino '0.85' como texto
-        return String(Math.round(n));
-    };
-
     const registros = [];
     for (let i = 2; i < rowsResp.length; i++) {
         const row = rowsResp[i];
