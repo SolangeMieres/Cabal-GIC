@@ -130,10 +130,19 @@ function normScore(v) {
     return String(Math.round(n));
 }
 
+function escapeHtml(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
 // Reglas de "No Aplica por Área": { "PRODUCTO": ["CR","MDA"] } — se carga desde la base
 let reglasNoAplica = {};
 // Bitácora diaria de la planificación: { "2026-09-25": [ {autor, texto, hora} ] }
 let bitacoraPlanificacion = {};
+
+// Seguimiento rápido de requerimientos en paralelo: array de ids de sesiones elegidas para seguir en conjunto
+let seguimientoSeleccion = [];
+// Aviso pendiente para Adriana cuando un seguimiento llega al 100%: { mensaje, fecha, vista }
+let notificacionAdriana = null;
 
 // ¿Este producto NO aplica al área de este operador? (regla automática por área)
 function noAplicaPorArea(op, curso) {
@@ -336,14 +345,17 @@ function iniciarEscuchaDatos() {
             historialAuditoria = data.historialAuditoria || [];
             reglasNoAplica = data.reglasNoAplica || {};
             bitacoraPlanificacion = data.bitacoraPlanificacion || {};
+            seguimientoSeleccion = data.seguimientoSeleccion || [];
+            notificacionAdriana = data.notificacionAdriana || null;
 
-            aplicarInterfazLogueada(); 
-            crearEncabezado(); 
-            actualizarFiltros(); 
-            crearTabla(); 
-            renderizarSesiones(); 
-            renderizarActividades(); 
+            aplicarInterfazLogueada();
+            crearEncabezado();
+            actualizarFiltros();
+            crearTabla();
+            renderizarSesiones();
+            renderizarActividades();
             actualizarDashboard();
+            mostrarNotificacionAdrianaSiHay();
         } else {
             console.warn("⚠️ La base de datos en la nube parece estar vacía.");
         }
@@ -1310,7 +1322,91 @@ async function cambiarEstadoRequerimiento(idSesion, nuevoEstado) {
             let revertidos = 0; sesion.convocados.forEach(conv => { let est = conv.estado ? conv.estado.toLowerCase() : ""; if (est === "presente") { conv.estado = "pendiente"; revertidos++; } }); Swal.fire({ toast: true, position: 'top-end', icon: 'warning', title: `Deshacer: Se revirtieron ${revertidos} operadores a Pendiente.`, showConfirmButton: false, timer: 3000 });
         }
         let labelCurso = (sesion.cursos && sesion.cursos.length > 0) ? sesion.cursos.join(' + ') : sesion.curso; registrarAccion(`Cambió estado del req. ${labelCurso} a: ${nuevoEstado}`); guardarDatos(); renderizarSesiones(); renderizarActividades(); crearTabla();
-    } 
+        verificarSeguimientoCompleto();
+    }
+}
+
+/* -------------------- 🎯 SEGUIMIENTO RÁPIDO DE REQUERIMIENTOS EN PARALELO -------------------- */
+// Guarda un comentario libre en el encabezado azul de la tarjeta del requerimiento
+function actualizarComentarioSesion(idSesion, texto) {
+    let sesion = sesiones.find(s => s.id.toString() === idSesion.toString());
+    if (!sesion) return;
+    if ((sesion.comentarios || '') === texto) return; // sin cambios, no gastar una escritura
+    sesion.comentarios = texto;
+    registrarAccion(`Editó comentarios del req. ${(sesion.cursos || [sesion.curso]).join(' + ')}`);
+    guardarDatos();
+}
+
+// Suma o saca un requerimiento de la selección de seguimiento conjunto
+async function toggleSeguimiento(idSesion) {
+    let idStr = idSesion.toString();
+    let i = seguimientoSeleccion.indexOf(idStr);
+    if (i >= 0) seguimientoSeleccion.splice(i, 1); else seguimientoSeleccion.push(idStr);
+    await db.ref('GAC_Sistema/seguimientoSeleccion').set(seguimientoSeleccion);
+    renderizarSesiones();
+}
+
+async function vaciarSeguimiento() {
+    seguimientoSeleccion = [];
+    await db.ref('GAC_Sistema/seguimientoSeleccion').set([]);
+    renderizarSesiones();
+}
+
+// Arma la barra flotante con el % de avance de los requerimientos elegidos para seguir juntos
+function renderizarBarraSeguimiento() {
+    let cont = document.getElementById('barra-seguimiento');
+    if (!cont) return;
+    if (!seguimientoSeleccion || seguimientoSeleccion.length === 0) { cont.innerHTML = ''; return; }
+
+    let elegidos = sesiones.filter(s => seguimientoSeleccion.includes(s.id.toString()));
+    let total = elegidos.length;
+    let finalizados = elegidos.filter(s => s.estadoReq === 'Finalizado').length;
+    let pct = total > 0 ? Math.round((finalizados / total) * 100) : 0;
+    let nombres = elegidos.map(s => (s.cursos && s.cursos.length > 0) ? s.cursos.join('+') : (s.curso || 'Sin producto'));
+
+    cont.innerHTML = `
+        <div style="background:#eafaf1; border:1px solid #27ae60; border-radius:8px; padding:12px 15px; margin-bottom:20px; display:flex; align-items:center; gap:15px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:220px;">
+                <b style="color:#1e8449;">🎯 Seguimiento conjunto (${total} req.):</b>
+                <span style="font-size:12px; color:#555;"> ${nombres.join(' | ')}</span>
+                <div style="background:#d5f5e3; border-radius:6px; height:14px; margin-top:6px; overflow:hidden;">
+                    <div style="background:#27ae60; height:100%; width:${pct}%; transition: width 0.3s;"></div>
+                </div>
+            </div>
+            <div style="font-weight:bold; color:#1e8449; font-size:16px;">${finalizados}/${total} (${pct}%)</div>
+            <button onclick="vaciarSeguimiento()" style="background:#7f8c8d; color:white; border:none; padding:6px 10px; border-radius:5px; cursor:pointer; font-size:12px;">Vaciar</button>
+        </div>`;
+}
+
+// Si todos los requerimientos elegidos llegaron a "Finalizado", deja un aviso pendiente para Adriana
+async function verificarSeguimientoCompleto() {
+    if (!seguimientoSeleccion || seguimientoSeleccion.length === 0) return;
+    let elegidos = sesiones.filter(s => seguimientoSeleccion.includes(s.id.toString()));
+    if (elegidos.length === 0 || elegidos.length !== seguimientoSeleccion.length) return;
+    let todosFinalizados = elegidos.every(s => s.estadoReq === 'Finalizado');
+    if (!todosFinalizados) return;
+
+    let nombres = elegidos.map(s => (s.cursos && s.cursos.length > 0) ? s.cursos.join('+') : (s.curso || 'Sin producto'));
+    let mensaje = `Se completó el 100% del seguimiento conjunto: ${nombres.join(' | ')}`;
+    registrarAccion(`Seguimiento conjunto llegó al 100% (${nombres.join(' | ')})`);
+    await db.ref('GAC_Sistema/notificacionAdriana').set({ mensaje, fecha: new Date().toLocaleString('es-AR'), vista: false });
+    await db.ref('GAC_Sistema/seguimientoSeleccion').set([]); // se vacía para poder armar el próximo seguimiento
+    Swal.fire({ icon: 'success', title: '🎉 ¡100% completado!', text: 'Se dejó un aviso para Adriana la próxima vez que entre al sistema.', timer: 3500, showConfirmButton: false });
+}
+
+// Muestra el aviso pendiente (si hay uno sin ver) la próxima vez que alguien entra al sistema
+async function mostrarNotificacionAdrianaSiHay() {
+    if (!notificacionAdriana || notificacionAdriana.vista) return;
+    const { isConfirmed } = await Swal.fire({
+        icon: 'success',
+        title: '📣 Aviso para Adriana',
+        html: `<p>${notificacionAdriana.mensaje}</p><p style="font-size:12px; color:#7f8c8d;">${notificacionAdriana.fecha}</p>`,
+        confirmButtonText: 'Entendido',
+        confirmButtonColor: '#27ae60'
+    });
+    if (isConfirmed) {
+        await db.ref('GAC_Sistema/notificacionAdriana/vista').set(true);
+    }
 }
 
 /* -------------------- 🆕 FUNCIONES NUEVAS (Excel líderes / estado masivo / duplicados) -------------------- */
@@ -1509,6 +1605,7 @@ function renderizarSesiones() {
                     <span class="badge-tipo">${sesion.tipo}</span> ${badgeVinculo} ${btnEditar}${btnEliminar}
                     <h3>${tituloTarjeta}</h3>
                     <p class="entrenador">${sesion.entrenador}</p>
+                    <textarea placeholder="Agregar comentario..." onchange="actualizarComentarioSesion('${sesion.id}', this.value)" ${!modoEdicion ? 'disabled' : ''} style="width:100%; margin-top:8px; padding:6px 8px; border-radius:4px; border:none; background:rgba(255,255,255,0.18); color:white; font-size:12px; resize:vertical; min-height:32px; box-sizing:border-box;">${escapeHtml(sesion.comentarios)}</textarea>
                 </div>
                 <div class="card-sesion-body">
                     <div class="info-fechas">
@@ -1523,6 +1620,7 @@ function renderizarSesiones() {
                             <option value="Finalizado" ${estadoReq === 'Finalizado' ? 'selected' : ''}>✅ Finalizado</option>
                         </select>
                     </div>
+                    ${!esArchivada ? `<label style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size:12px; cursor:pointer;"><input type="checkbox" onchange="toggleSeguimiento('${sesion.id}')" ${seguimientoSeleccion.includes(sesion.id.toString()) ? 'checked' : ''} ${!modoEdicion ? 'disabled' : ''}> 🎯 Sumar a seguimiento conjunto</label>` : ''}
                     ${btnNotas}
                     ${btnVincularCR}
                     ${enlacesHTML}
@@ -1542,6 +1640,7 @@ function renderizarSesiones() {
     });
 
     contenedorActivas.innerHTML = htmlActivas;
+    renderizarBarraSeguimiento();
 
     if (contenedorArchivadas) {
         if (cantArchivadas > 0) {
@@ -1716,7 +1815,7 @@ async function archivarSesion(idSesion) {
         if (isConfirmed) {
             let fechaParaGuardar = sesion.fechaFin || sesion.fechaInicio || new Date().toISOString().split('T')[0];
             presentesSinEvaluar.forEach(conv => { let op = operadores.find(o => o.nombre === conv.nombre); if (op) { cursosAImpactar.forEach(cursoActual => { let codigoReal = Object.keys(mapaCodigos).find(key => mapaCodigos[key] === cursoActual && key.startsWith(sesion.tipo)) || ""; upsertHistorial(op, cursoActual, { tipo: sesion.tipo, codigo: codigoReal, fecha: fechaParaGuardar, porcentaje: "N/A" }, sesion.id); }); } conv.estado = "capacitado"; });
-            sesion.activa = false; sesion.estadoReq = "Finalizado"; syncEstadoActividad(sesion.id.toString(), "Finalizado"); registrarAccion(`Autoevaluó y archivó sesión de: ${cursosAImpactar.join(' + ')}`); guardarDatos(); crearTabla(); renderizarSesiones(); renderizarActividades(); Swal.fire('¡Solucionado!', 'Sesión archivada y Matriz actualizada.', 'success');
+            sesion.activa = false; sesion.estadoReq = "Finalizado"; syncEstadoActividad(sesion.id.toString(), "Finalizado"); registrarAccion(`Autoevaluó y archivó sesión de: ${cursosAImpactar.join(' + ')}`); guardarDatos(); crearTabla(); renderizarSesiones(); renderizarActividades(); verificarSeguimientoCompleto(); Swal.fire('¡Solucionado!', 'Sesión archivada y Matriz actualizada.', 'success');
         }
     } else { 
         const { isConfirmed } = await Swal.fire({ title: '¿Archivar Sesión?', text: "La tarjeta pasará al historial de archivadas en la parte inferior.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#7f8c8d', cancelButtonColor: '#d33', confirmButtonText: 'Sí, archivar', cancelButtonText: 'Cancelar' }); 
