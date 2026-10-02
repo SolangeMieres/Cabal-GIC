@@ -11,6 +11,241 @@ const firebaseConfig = {
 
 if (!firebase.apps.length) { firebase.initializeApp(firebaseConfig); }
 const db = firebase.database();
+const auth = firebase.auth();
+
+/* 🔐 Roles y perfiles de usuario
+   Los admin fijos SIEMPRE tienen edición y acceso al panel de usuarios (no se pueden quitar desde la base). */
+const ADMINS_FIJOS = ["mieres@cabal.coop", "bandin@cabal.coop", "hacaraballo@cabal.coop", "klehr@cabal.coop"];
+
+/* Fallback: se usa solo si el usuario todavía no está cargado en la base /usuarios_config.
+   Una vez migrados a la base, este mapa deja de tener efecto. */
+const ROLES_POR_EMAIL = {
+    "supervisores@cabal.coop": "supervisor",
+    "hucaa@cabal.coop": "gerente",
+    "wraidan@cabal.coop": "gerente"
+};
+const SEGMENTO_POR_ROL = { supervisor: "Líder", gerente: "TODOS", lectura: "TODOS" };
+
+// Segmentos que cada rol tiene permitido VER. Admin y gerente ven todos.
+// - Sin login: solo Operador
+// - supervisor: Operador + Líder
+// - gerente (Walter/Alcira): todos
+const SEGMENTOS_PERMITIDOS = {
+    publico:    ["Operador"],                                   // sin login
+    lectura:    ["Operador"],                                   // lectura básica
+    supervisor: ["Operador", "Líder"],
+    gerente:    ["Operador", "Líder", "Supervisor", "Analista"], // ve todos, sin editar
+    admin:      ["Operador", "Líder", "Supervisor", "Analista"]
+};
+
+// Devuelve la lista de segmentos que puede ver el email dado
+function segmentosPermitidosDe(email) {
+    email = (email || "").toLowerCase().trim();
+    if (!email) return SEGMENTOS_PERMITIDOS.publico;      // sin login → solo Operadores
+    if (esAdminFijo(email)) return SEGMENTOS_PERMITIDOS.admin; // admin → todo
+    if (rolDeEmail(email) === null) return SEGMENTOS_PERMITIDOS.admin; // perfil edición sin tildes → todo
+
+    // Usuario con config: sus segmentos tildados (Operador siempre incluido)
+    let entry = Object.values(usuariosConfig).find(u => (u.email || "").toLowerCase() === email);
+    if (entry && Array.isArray(entry.segmentos) && entry.segmentos.length > 0) {
+        let segs = entry.segmentos.slice();
+        if (!segs.includes("Operador")) segs.unshift("Operador"); // Operadores siempre visible
+        return segs;
+    }
+    // Sin tildes configurados → solo Operadores
+    return ["Operador"];
+}
+
+// Config de usuarios cargada desde la base (se llena al arrancar)
+let usuariosConfig = {};
+
+function esAdminFijo(email) { return ADMINS_FIJOS.includes((email || "").toLowerCase().trim()); }
+
+// Rol de solo lectura de un email: primero la base, luego el fallback. null = admin/edición.
+function rolDeEmail(email) {
+    email = (email || "").toLowerCase().trim();
+    if (esAdminFijo(email)) return null; // admin siempre edición
+    // Buscar en la config de la base
+    let entry = Object.values(usuariosConfig).find(u => (u.email || "").toLowerCase() === email);
+    if (entry) {
+        if (entry.perfil === "edicion") return null;      // edición = como admin operativo
+        if (entry.perfil === "lectura") return "lectura"; // solo lectura general
+        if (entry.perfil === "supervisor") return "supervisor";
+        if (entry.perfil === "gerente") return "gerente";
+    }
+    // Fallback al mapa viejo; si tampoco está, NO es admin: solo lectura mínima por seguridad
+    if (ROLES_POR_EMAIL[email]) return ROLES_POR_EMAIL[email];
+    return "lectura"; // usuario logueado pero sin perfil asignado → solo lectura (no admin)
+}
+
+// ¿El email está bloqueado en la config?
+function estaBloqueado(email) {
+    email = (email || "").toLowerCase().trim();
+    if (esAdminFijo(email)) return false; // los admin fijos nunca se bloquean
+    let entry = Object.values(usuariosConfig).find(u => (u.email || "").toLowerCase() === email);
+    return entry ? entry.bloqueado === true : false;
+}
+
+// ¿Este usuario puede ver el Tablero de Jefatura? Admins siempre; el resto según el tilde "verPanel".
+function vePanelJefatura(email) {
+    email = (email || "").toLowerCase().trim();
+    if (esAdminFijo(email)) return true;
+    let entry = Object.values(usuariosConfig).find(u => (u.email || "").toLowerCase() === email);
+    return entry ? entry.verPanel === true : false;
+}
+
+// Muestra u oculta el botón del Tablero de Jefatura según el usuario actual
+function aplicarVisibilidadPanel() {
+    let btn = document.querySelector('.panel-jefatura');
+    if (!btn) return;
+    let email = auth.currentUser ? auth.currentUser.email : null;
+    btn.style.display = (email && vePanelJefatura(email)) ? 'inline-block' : 'none';
+}
+
+/* -------------------- VARIABLES GLOBALES Y MEMORIA DE SESIÓN -------------------- */
+let usuarioGuardado = localStorage.getItem("entrenadorActivo");
+let emailGuardado = localStorage.getItem("emailActivo");
+let modoEdicion = false;
+let usuarioActual = usuarioGuardado || "Sistema"; 
+let mostrarBajas = false; 
+let filtroSegmento = "TODOS"; // filtro de segmento actual en la matriz
+let rolVista = null; // null = admin/edición ; "supervisor" o "gerente" = vista de solo lectura
+const SEGMENTOS = ["Operador", "Líder", "Supervisor", "Analista"]; // segmentos disponibles
+const CLAVE_SECRETA = "Capacitacion2026"; 
+// Segmento efectivo de una persona (los que no tienen campo quedan como Operador)
+function segmentoDe(op) { return op.segmento || "Operador"; }
+
+// Normaliza un score/porcentaje sin importar cómo venga de Excel/SurveyMonkey.
+// Celda con formato % → xlsx da fracción (0.85) → 85. Texto "85%"/"85,5" → 85/85.5. Kahoot (>100) → se deja.
+function normScore(v) {
+    if (v === null || v === undefined || v === '') return null;
+    if (typeof v === 'number') {
+        if (v > 0 && v <= 1) return String(Math.round(v * 100));
+        return String(Math.round(v));
+    }
+    let s = String(v).replace('%', '').replace(',', '.').trim();
+    if (s === '' || isNaN(parseFloat(s))) return null;
+    let n = parseFloat(s);
+    if (n > 0 && n <= 1) n = n * 100;
+    return String(Math.round(n));
+}
+
+function escapeHtml(s) {
+    return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Reglas de "No Aplica por Área": { "PRODUCTO": ["CR","MDA"] } — se carga desde la base
+let reglasNoAplica = {};
+// Bitácora diaria de la planificación: { "2026-09-25": [ {autor, texto, hora} ] }
+let bitacoraPlanificacion = {};
+
+// Seguimiento rápido de requerimientos en paralelo: array de ids de sesiones elegidas para seguir en conjunto
+let seguimientoSeleccion = [];
+// Aviso pendiente para Adriana cuando un seguimiento llega al 100%: { mensaje, fecha, vista }
+let notificacionAdriana = null;
+
+// ¿Este producto NO aplica al área de este operador? (regla automática por área)
+function noAplicaPorArea(op, curso) {
+    let areas = reglasNoAplica[curso];
+    if (!areas || areas.length === 0) return false;
+    return areas.includes(op.area || "");
+}
+
+// Estado EFECTIVO de un operador en un producto: aplica la regla de área al vuelo,
+// sin pisar el dato guardado. Si el producto no aplica al área → "noaplica".
+function estadoEfectivo(op, curso) {
+    if (noAplicaPorArea(op, curso)) return "noaplica";
+    let info = op.estados && op.estados[curso];
+    return (info && info.estado) ? info.estado : "rojo";
+}
+// ¿Esta persona entra en el filtro de segmento actual?
+function pasaFiltroSegmento(op) {
+    // Segmentos que el usuario actual tiene permitido ver
+    let email = (auth.currentUser && auth.currentUser.email) ? auth.currentUser.email : null;
+    let permitidos = segmentosPermitidosDe(email);
+    let segOp = segmentoDe(op);
+    if (!permitidos.includes(segOp)) return false; // nunca mostrar segmentos no permitidos
+    // Dentro de lo permitido, aplica el filtro elegido en el selector
+    return filtroSegmento === "TODOS" || segOp === filtroSegmento;
+}
+
+// Restaurar sesión guardada: solo reactiva edición si el email NO es de solo lectura
+if (usuarioGuardado) {
+    let rolG = rolDeEmail(emailGuardado);
+    if (rolG) { rolVista = rolG; modoEdicion = false; filtroSegmento = SEGMENTO_POR_ROL[rolG] || "TODOS"; }
+    else { modoEdicion = true; }
+}
+
+/* ── Auth state listener ── */
+auth.onAuthStateChanged(user => {
+    if (user) {
+        usuarioActual = user.displayName || user.email.split('@')[0];
+        localStorage.setItem("entrenadorActivo", usuarioActual);
+        localStorage.setItem("emailActivo", (user.email || "").toLowerCase());
+        document.getElementById('loginModal') && (document.getElementById('loginModal').style.display = 'none');
+
+        // Ahora que hay sesión, Firebase permite leer: enganchamos la escucha de datos
+        iniciarEscuchaDatos();
+
+        // Chequeo de bloqueo (por base de datos)
+        if (estaBloqueado(user.email)) {
+            Swal.fire({ title: 'Usuario bloqueado', text: 'Tu acceso fue deshabilitado. Contactá al administrador.', icon: 'error', allowOutsideClick: false })
+                .then(() => { auth.signOut(); });
+            return;
+        }
+
+        let rol = (typeof rolDeEmail === 'function') ? rolDeEmail(user.email) : null;
+        if (rol) {
+            // Solo lectura (supervisor / gerente / lectura)
+            rolVista = rol; modoEdicion = false;
+            filtroSegmento = SEGMENTO_POR_ROL[rol] || "TODOS";
+            aplicarModoSoloLectura();
+            aplicarVisibilidadPanel(); poblarSelectorSegmentos();
+            renderizarSesiones && renderizarSesiones(); renderizarActividades && renderizarActividades();
+        } else {
+            // Admin / edición
+            rolVista = null; modoEdicion = true;
+            aplicarInterfazLogueada();
+            aplicarVisibilidadPanel(); poblarSelectorSegmentos();
+            crearEncabezado(); crearTabla(); renderizarSesiones(); renderizarActividades();
+        }
+    } else {
+        modoEdicion = false; rolVista = null;
+        usuarioActual = "Sistema";
+        localStorage.removeItem("entrenadorActivo"); localStorage.removeItem("emailActivo");
+        // Reset visual al estado "sin login": solo Operadores, sin tablero, sin panel admin
+        filtroSegmento = "Operador";
+        let panelAdmin = document.getElementById("panelAdmin"); if (panelAdmin) panelAdmin.style.display = "none";
+        document.querySelectorAll('.admin-only').forEach(btn => btn.style.display = 'none');
+        let btnCfg = document.getElementById("btnConfigUsuarios"); if (btnCfg) btnCfg.style.display = "none";
+        let btnLogin = document.getElementById("btnLogin"); if (btnLogin) { btnLogin.innerHTML = "🔒 Activar Edición"; btnLogin.style.backgroundColor = "#34495e"; }
+        // Cargar datos (lectura abierta) y aplicar restricciones de segmento del público
+        iniciarEscuchaDatos();
+        poblarSelectorSegmentos();
+        aplicarVisibilidadPanel();
+        crearEncabezado(); crearTabla(); actualizarDashboard();
+    }
+});
+
+async function iniciarSesion() {
+    const email = document.getElementById('emailInput') ? document.getElementById('emailInput').value : '';
+    const pass  = document.getElementById('passwordInput') ? document.getElementById('passwordInput').value : '';
+    if (!email || !pass) { Swal.fire('Error', 'Ingresá tu email y contraseña.', 'error'); return; }
+    try {
+        await auth.signInWithEmailAndPassword(email, pass);
+        Swal.close();
+    } catch (e) {
+        Swal.fire('Error', 'Usuario o contraseña incorrectos.', 'error');
+    }
+}
+
+async function cerrarSesion() {
+    await auth.signOut();
+    modoEdicion = false;
+    usuarioActual = "Sistema";
+    localStorage.removeItem("entrenadorActivo");
+    location.reload();
+}
 
 /* -------------------- MAPA DE CODIGOS DEFAULT -------------------- */
 const mapaCodigosDefault = {
@@ -47,13 +282,6 @@ const mapaCodigosDefault = {
 let mapaLocal = JSON.parse(localStorage.getItem("mapaCodigos"));
 let mapaCodigos = (mapaLocal && Object.keys(mapaLocal).length > 0) ? mapaLocal : mapaCodigosDefault;
 
-/* -------------------- VARIABLES GLOBALES Y MEMORIA DE SESIÓN -------------------- */
-let usuarioGuardado = localStorage.getItem("entrenadorActivo");
-let modoEdicion = usuarioGuardado ? true : false;
-let usuarioActual = usuarioGuardado || "Sistema"; 
-let mostrarBajas = false; 
-const CLAVE_SECRETA = "Capacitacion2026"; 
-
 let cursos = [...new Set(Object.values(mapaCodigos))]; 
 let operadores = [];
 let sesiones = [];
@@ -66,9 +294,39 @@ let chart;
 let chartTopCursos, chartNotas; 
 
 /* -------------------- 🔥 SINCRONIZACIÓN MAESTRA 🔥 -------------------- */
-function guardarDatos() {
+// bitacoraPlanificacion queda afuera a propósito: este set() sobreescribe todo el nodo
+// con lo que esta pestaña tiene en memoria, y si otra pestaña quedó desincronizada
+// (ej. laptop en reposo) borraba comentarios recién agregados por otros entrenadores.
+// Esa sección se guarda aparte, en su propio path (ver guardarComentarioDiario).
+async function guardarDatos() {
     if (operadores.length > 0) {
-        db.ref('GAC_Sistema').set({ mapaCodigos, operadores, sesiones, actividades, historialAuditoria });
+        try {
+            await db.ref('GAC_Sistema').set({ mapaCodigos, operadores, sesiones, actividades, historialAuditoria, reglasNoAplica });
+        } catch (err) {
+            console.error('Error al guardar:', err);
+            if (err.code === 'PERMISSION_DENIED') {
+                Swal.fire({ icon: 'error', title: 'Sin permiso', text: 'No podés guardar cambios. Activá la edición con tu usuario.', timer: 3000, showConfirmButton: false });
+            }
+        }
+    }
+}
+
+// Guarda sólo los campos indicados (bitacoraPlanificacion, seguimientoSeleccion, notificacionAdriana)
+// con update() sobre el mismo path que ya usa guardarDatos() -> mismos permisos, y al ser update()
+// (no set()) no pisa el resto del nodo. Nunca tira: si falla, avisa y deja seguir la UI en vez de
+// cortar en silencio (eso era lo que hacía parecer que la bitácora "no dejaba escribir").
+async function guardarCampoGAC(cambios) {
+    try {
+        await db.ref('GAC_Sistema').update(cambios);
+        return true;
+    } catch (err) {
+        console.error('Error al guardar:', err);
+        if (err.code === 'PERMISSION_DENIED') {
+            Swal.fire({ icon: 'error', title: 'Sin permiso', text: 'No podés guardar cambios. Activá la edición con tu usuario.', timer: 3000, showConfirmButton: false });
+        } else {
+            Swal.fire({ icon: 'error', title: 'No se pudo guardar', text: 'Revisá tu conexión e intentá de nuevo.', timer: 3000, showConfirmButton: false });
+        }
+        return false;
     }
 }
 
@@ -83,35 +341,272 @@ function registrarAccion(detalle, usuarioEspecial = null) {
     guardarDatos();
 }
 
-db.ref('GAC_Sistema').on('value', (snapshot) => {
-    const data = snapshot.val();
-    if (data) {
-        if (data.mapaCodigos) mapaCodigos = data.mapaCodigos;
-        cursos = [...new Set(Object.values(mapaCodigos))];
-        
-        if (data.operadores) { 
-            operadores = data.operadores; 
-            operadores.forEach(op => { 
-                if (!op.estados) op.estados = {}; 
-                if(op.activo === undefined) op.activo = true; 
-            }); 
-        } else { operadores = []; }
+let _dataListenerAttached = false;
+function iniciarEscuchaDatos() {
+    if (_dataListenerAttached) return; // no enganchar dos veces
+    _dataListenerAttached = true;
+    db.ref('GAC_Sistema').on('value', (snapshot) => {
+        const data = snapshot.val();
+        if (data) {
+            if (data.mapaCodigos) mapaCodigos = data.mapaCodigos;
+            cursos = [...new Set(Object.values(mapaCodigos))];
 
-        sesiones = data.sesiones || [];
-        actividades = data.actividades || [];
-        historialAuditoria = data.historialAuditoria || [];
-        
-        aplicarInterfazLogueada(); 
-        crearEncabezado(); 
-        actualizarFiltros(); 
-        crearTabla(); 
-        renderizarSesiones(); 
-        renderizarActividades(); 
-        actualizarDashboard();
-    } else {
-        console.warn("⚠️ La base de datos en la nube parece estar vacía.");
+            if (data.operadores) { 
+                operadores = data.operadores; 
+                operadores.forEach(op => { 
+                    if (!op.estados) op.estados = {}; 
+                    if(op.activo === undefined) op.activo = true; 
+                }); 
+            } else { operadores = []; }
+
+            sesiones = data.sesiones || [];
+            actividades = data.actividades || [];
+            historialAuditoria = data.historialAuditoria || [];
+            reglasNoAplica = data.reglasNoAplica || {};
+            bitacoraPlanificacion = data.bitacoraPlanificacion || {};
+            seguimientoSeleccion = data.seguimientoSeleccion || [];
+            notificacionAdriana = data.notificacionAdriana || null;
+
+            aplicarInterfazLogueada();
+            crearEncabezado();
+            actualizarFiltros();
+            crearTabla();
+            renderizarSesiones();
+            renderizarActividades();
+            actualizarDashboard();
+            mostrarNotificacionAdrianaSiHay();
+        } else {
+            console.warn("⚠️ La base de datos en la nube parece estar vacía.");
+        }
+    }, (error) => {
+        console.warn("No se pudo leer la base (¿sin sesión?):", error && error.message);
+    });
+
+    // Cargar la config de usuarios (perfiles/bloqueos) para el control de acceso por roles
+    db.ref('usuarios_config').on('value', (snap) => {
+        usuariosConfig = snap.val() || {};
+        // Si hay una sesión activa, reevaluar su rol por si cambió su perfil/bloqueo
+        if (auth.currentUser) reaplicarRolActual(auth.currentUser);
+    }, (err) => {
+        console.warn("No se pudo leer usuarios_config:", err && err.message);
+    });
+}
+
+// Reaplica el rol del usuario actual según la config vigente (sin recargar la página)
+function reaplicarRolActual(user) {
+    if (!user) return;
+    if (estaBloqueado(user.email)) {
+        Swal.fire({ title: 'Usuario bloqueado', text: 'Tu acceso fue deshabilitado. Contactá al administrador.', icon: 'error', allowOutsideClick: false })
+            .then(() => { auth.signOut(); });
+        return;
     }
-});
+    let rol = rolDeEmail(user.email);
+    if (rol) {
+        rolVista = rol; modoEdicion = false;
+        filtroSegmento = SEGMENTO_POR_ROL[rol] || "TODOS";
+        aplicarModoSoloLectura();
+    } else {
+        rolVista = null; modoEdicion = true;
+        aplicarInterfazLogueada();
+        crearEncabezado(); crearTabla();
+    }
+    aplicarVisibilidadPanel(); poblarSelectorSegmentos();
+}
+
+/* -------------------- 👥 PANEL ABM DE USUARIOS (solo admin) -------------------- */
+
+// ¿El usuario actual puede administrar usuarios? Solo los admin fijos.
+function puedeAdministrarUsuarios() {
+    return auth.currentUser && esAdminFijo(auth.currentUser.email);
+}
+
+// Abre el panel de configuración de usuarios
+async function abrirPanelUsuarios() {
+    if (!puedeAdministrarUsuarios()) { Swal.fire('Acceso denegado', 'Solo los administradores pueden gestionar usuarios.', 'warning'); return; }
+
+    const perfilLabel = { lectura: 'Visualización', edicion: 'Visualización + Edición', supervisor: 'Supervisor', gerente: 'Gerente' };
+    let filas = Object.entries(usuariosConfig).map(([id, u]) => {
+        let estado = u.bloqueado ? '<span style="color:#c0392b;font-weight:bold;">🚫 Bloqueado</span>' : '<span style="color:#27ae60;font-weight:bold;">✅ Activo</span>';
+        let panelTag = u.verPanel ? ' <span style="background:#8e44ad;color:white;font-size:10px;padding:1px 6px;border-radius:8px;">📈 Panel</span>' : '';
+        let segs = Array.isArray(u.segmentos) ? u.segmentos.filter(s => s !== 'Operador') : [];
+        let segsTag = segs.length ? ` <span style="color:#555;font-size:10px;">+ ${segs.join(', ')}</span>` : '';
+        return `<tr style="border-bottom:1px solid #eee;">
+            <td style="padding:8px;text-align:left;font-size:12px;">${u.email}</td>
+            <td style="padding:8px;font-size:12px;">${perfilLabel[u.perfil] || u.perfil}${segsTag}${panelTag}</td>
+            <td style="padding:8px;font-size:12px;">${estado}</td>
+            <td style="padding:8px;white-space:nowrap;">
+                <button onclick="resetPassUsuario('${u.email}')" title="Restablecer contraseña" style="background:#f39c12;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">🔑</button>
+                <button onclick="toggleBloqueoUsuario('${id}')" title="${u.bloqueado ? 'Desbloquear' : 'Bloquear'}" style="background:${u.bloqueado ? '#27ae60' : '#c0392b'};color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">${u.bloqueado ? '🔓' : '🔒'}</button>
+                <button onclick="cambiarPerfilUsuario('${id}')" title="Editar perfil" style="background:#2980b9;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">✏️</button>
+                <button onclick="eliminarUsuario('${id}')" title="Eliminar usuario" style="background:#7f2d1c;color:white;border:none;border-radius:4px;padding:4px 7px;margin:1px;cursor:pointer;">🗑️</button>
+            </td></tr>`;
+    }).join('');
+
+    if (!filas) filas = `<tr><td colspan="4" style="padding:15px;color:#999;">Todavía no hay usuarios cargados. Creá el primero.</td></tr>`;
+
+    await Swal.fire({
+        title: '👥 Configuración de usuarios',
+        width: 700,
+        html: `<div style="text-align:right;margin-bottom:10px;">
+                    <button onclick="crearUsuarioNuevo()" style="background:#27ae60;color:white;border:none;border-radius:5px;padding:8px 14px;font-weight:bold;cursor:pointer;">➕ Crear usuario</button>
+               </div>
+               <div style="max-height:340px;overflow-y:auto;border:1px solid #eee;border-radius:6px;">
+                    <table style="width:100%;border-collapse:collapse;">
+                        <thead><tr style="background:#f5f5f5;position:sticky;top:0;">
+                            <th style="padding:8px;text-align:left;font-size:12px;">Email</th>
+                            <th style="padding:8px;font-size:12px;">Perfil</th>
+                            <th style="padding:8px;font-size:12px;">Estado</th>
+                            <th style="padding:8px;font-size:12px;">Acciones</th>
+                        </tr></thead>
+                        <tbody>${filas}</tbody>
+                    </table>
+               </div>
+               <p style="font-size:11px;color:#999;margin-top:8px;">Los administradores (${ADMINS_FIJOS.length}) siempre tienen edición y no aparecen en esta lista.</p>`,
+        showConfirmButton: true, confirmButtonText: 'Cerrar'
+    });
+}
+
+// Crea un usuario nuevo usando una app secundaria (para no desloguear al admin)
+async function crearUsuarioNuevo() {
+    const { value: form } = await Swal.fire({
+        title: 'Crear usuario nuevo',
+        html: `<input id="nu-email" class="swal2-input" placeholder="email@cabal.coop" type="email">
+               <input id="nu-pass" class="swal2-input" placeholder="Contraseña (mín. 6)" type="text">
+               <select id="nu-perfil" class="swal2-select" style="width:90%;padding:8px;">
+                    <option value="lectura">Visualización</option>
+                    <option value="edicion">Visualización + Edición</option>
+               </select>
+               <div style="text-align:left;padding:8px 5%;font-size:13px;">
+                    <b>¿Qué segmentos puede ver?</b>
+                    <label style="display:block;margin-top:4px;"><input type="checkbox" checked disabled> Operadores <span style="color:#999;">(siempre)</span></label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Líder"> Líderes</label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Supervisor"> Supervisores</label>
+                    <label style="display:block;"><input type="checkbox" class="nu-seg" value="Analista"> Analistas</label>
+               </div>
+               <label style="display:block;margin-top:6px;font-size:14px;text-align:left;padding-left:5%;">
+                    <input type="checkbox" id="nu-panel"> Ve el Tablero de Jefatura
+               </label>`,
+        showCancelButton: true, confirmButtonText: 'Crear',
+        preConfirm: () => {
+            let email = document.getElementById('nu-email').value.trim().toLowerCase();
+            let pass = document.getElementById('nu-pass').value;
+            let perfil = document.getElementById('nu-perfil').value;
+            let verPanel = document.getElementById('nu-panel').checked;
+            let segmentos = ["Operador", ...Array.from(document.querySelectorAll('.nu-seg:checked')).map(c => c.value)];
+            if (!email || !email.includes('@')) { Swal.showValidationMessage('Email inválido'); return false; }
+            if (!pass || pass.length < 6) { Swal.showValidationMessage('La contraseña debe tener al menos 6 caracteres'); return false; }
+            return { email, pass, perfil, verPanel, segmentos };
+        }
+    });
+    if (!form) return;
+
+    // App secundaria: crea el usuario sin tocar la sesión del admin
+    let appSec;
+    try {
+        appSec = firebase.initializeApp(firebaseConfig, 'Secundaria_' + Date.now());
+        const cred = await appSec.auth().createUserWithEmailAndPassword(form.email, form.pass);
+        const uid = cred.user.uid;
+        await db.ref('usuarios_config/' + uid).set({
+            email: form.email, perfil: form.perfil, verPanel: form.verPanel, segmentos: form.segmentos, bloqueado: false,
+            creadoPor: usuarioActual, fecha: new Date().toLocaleString('es-AR')
+        });
+        await appSec.auth().signOut();
+        registrarAccion(`Creó el usuario ${form.email} (perfil: ${form.perfil})`);
+        Swal.fire('¡Usuario creado!', `${form.email} ya puede ingresar.`, 'success').then(() => abrirPanelUsuarios());
+    } catch (e) {
+        let msg = e.code === 'auth/email-already-in-use' ? 'Ese email ya está registrado.' : (e.message || 'Error al crear el usuario.');
+        Swal.fire('Error', msg, 'error');
+    } finally {
+        if (appSec) { try { await appSec.delete(); } catch (_) {} }
+    }
+}
+
+// Bloquea o desbloquea un usuario (por base de datos)
+async function toggleBloqueoUsuario(id) {
+    let u = usuariosConfig[id]; if (!u) return;
+    let nuevoEstado = !u.bloqueado;
+    const { isConfirmed } = await Swal.fire({
+        title: nuevoEstado ? '¿Bloquear usuario?' : '¿Desbloquear usuario?',
+        text: `${u.email}`, icon: 'question', showCancelButton: true,
+        confirmButtonText: nuevoEstado ? 'Bloquear' : 'Desbloquear',
+        confirmButtonColor: nuevoEstado ? '#c0392b' : '#27ae60'
+    });
+    if (!isConfirmed) return;
+    await db.ref('usuarios_config/' + id + '/bloqueado').set(nuevoEstado);
+    registrarAccion(`${nuevoEstado ? 'Bloqueó' : 'Desbloqueó'} al usuario ${u.email}`);
+    abrirPanelUsuarios();
+}
+
+// Cambia el perfil (visualización <-> edición) y el acceso al panel de un usuario
+async function cambiarPerfilUsuario(id) {
+    let u = usuariosConfig[id]; if (!u) return;
+    let segsActuales = Array.isArray(u.segmentos) ? u.segmentos : [];
+    const { value: form } = await Swal.fire({
+        title: 'Editar perfil', 
+        html: `<p style="font-size:13px;color:#555;margin-bottom:10px;">${u.email}</p>
+               <select id="ep-perfil" class="swal2-select" style="width:90%;padding:8px;">
+                    <option value="lectura" ${u.perfil === 'lectura' ? 'selected' : ''}>Visualización</option>
+                    <option value="edicion" ${u.perfil === 'edicion' ? 'selected' : ''}>Visualización + Edición</option>
+               </select>
+               <div style="text-align:left;padding:8px 5%;font-size:13px;">
+                    <b>¿Qué segmentos puede ver?</b>
+                    <label style="display:block;margin-top:4px;"><input type="checkbox" checked disabled> Operadores <span style="color:#999;">(siempre)</span></label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Líder" ${segsActuales.includes('Líder') ? 'checked' : ''}> Líderes</label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Supervisor" ${segsActuales.includes('Supervisor') ? 'checked' : ''}> Supervisores</label>
+                    <label style="display:block;"><input type="checkbox" class="ep-seg" value="Analista" ${segsActuales.includes('Analista') ? 'checked' : ''}> Analistas</label>
+               </div>
+               <label style="display:block;margin-top:6px;font-size:14px;text-align:left;padding-left:5%;">
+                    <input type="checkbox" id="ep-panel" ${u.verPanel ? 'checked' : ''}> Ve el Tablero de Jefatura
+               </label>`,
+        showCancelButton: true, confirmButtonText: 'Guardar',
+        preConfirm: () => ({
+            perfil: document.getElementById('ep-perfil').value,
+            verPanel: document.getElementById('ep-panel').checked,
+            segmentos: ["Operador", ...Array.from(document.querySelectorAll('.ep-seg:checked')).map(c => c.value)]
+        })
+    });
+    if (!form) return;
+    await db.ref('usuarios_config/' + id).update({ perfil: form.perfil, verPanel: form.verPanel, segmentos: form.segmentos });
+    registrarAccion(`Editó el perfil de ${u.email}: ${form.perfil}, segmentos [${form.segmentos.join(', ')}]${form.verPanel ? ', +panel' : ''}`);
+    abrirPanelUsuarios();
+}
+
+// Envía mail de restablecimiento de contraseña
+async function resetPassUsuario(email) {
+    const { isConfirmed } = await Swal.fire({
+        title: '¿Restablecer contraseña?',
+        html: `Se enviará un correo a <b>${email}</b> con un enlace para que defina una contraseña nueva.`,
+        icon: 'question', showCancelButton: true, confirmButtonText: 'Enviar correo'
+    });
+    if (!isConfirmed) return;
+    try {
+        await auth.sendPasswordResetEmail(email);
+        registrarAccion(`Envió restablecimiento de contraseña a ${email}`);
+        Swal.fire('Correo enviado', `${email} recibirá el enlace para cambiar su contraseña.`, 'success').then(() => abrirPanelUsuarios());
+    } catch (e) {
+        Swal.fire('Error', e.message || 'No se pudo enviar el correo.', 'error');
+    }
+}
+
+// Elimina un usuario de la lista de configuración (pierde su perfil y acceso en el GIC)
+async function eliminarUsuario(id) {
+    let u = usuariosConfig[id]; if (!u) return;
+    const { isConfirmed } = await Swal.fire({
+        title: '¿Eliminar usuario?',
+        html: `Se quitará a <b>${u.email}</b> de la lista y perderá su acceso al GIC.<br><br><span style="font-size:12px;color:#7f8c8d;">Nota: su cuenta de correo en el sistema de autenticación no se elimina desde acá; queda sin permisos.</span>`,
+        icon: 'warning', showCancelButton: true, confirmButtonColor: '#c0392b',
+        confirmButtonText: 'Sí, eliminar', cancelButtonText: 'Cancelar'
+    });
+    if (!isConfirmed) return;
+    try {
+        await db.ref('usuarios_config/' + id).remove();
+        registrarAccion(`Eliminó al usuario ${u.email} de la configuración`);
+        Swal.fire('Eliminado', `${u.email} fue quitado de la lista.`, 'success').then(() => abrirPanelUsuarios());
+    } catch (e) {
+        Swal.fire('Error', e.message || 'No se pudo eliminar.', 'error');
+    }
+}
+iniciarEscuchaDatos();
 
 /* -------------------- 🗂️ NAVEGACIÓN Y FILTROS -------------------- */
 function cambiarModulo(idModulo, elementoBoton) {
@@ -130,18 +625,145 @@ function actualizarFiltros() {
     }
 }
 
+// Rellena el selector de segmentos con SOLO los que el usuario actual puede ver
+function poblarSelectorSegmentos() {
+    let sel = document.getElementById("filtroSegmento");
+    if (!sel) return;
+    let email = (auth.currentUser && auth.currentUser.email) ? auth.currentUser.email : null;
+    let permitidos = segmentosPermitidosDe(email);
+    let labels = { Operador: "Operadores", Líder: "Líderes", Supervisor: "Supervisores", Analista: "Analistas de Calidad" };
+
+    let opciones = "";
+    // "Todos los segmentos" solo si ve más de uno
+    if (permitidos.length > 1) opciones += `<option value="TODOS">👥 Todos los segmentos</option>`;
+    permitidos.forEach(s => { opciones += `<option value="${s}">${labels[s] || s}</option>`; });
+    sel.innerHTML = opciones;
+
+    // Ajustar el filtro actual si quedó fuera de lo permitido
+    if (filtroSegmento !== "TODOS" && !permitidos.includes(filtroSegmento)) {
+        filtroSegmento = permitidos.length > 1 ? "TODOS" : permitidos[0];
+    }
+    if (permitidos.length === 1) filtroSegmento = permitidos[0]; // un solo segmento: fijo
+    sel.value = filtroSegmento;
+}
+
 /* -------------------- 📈 DASHBOARD Y MÉTRICAS -------------------- */
+// Cambia el segmento visible en la matriz y refresca todo
+function cambiarSegmento(valor) {
+    let email = (auth.currentUser && auth.currentUser.email) ? auth.currentUser.email : null;
+    let permitidos = segmentosPermitidosDe(email);
+    // Si el valor elegido no está permitido, se ignora y se reajusta
+    if (valor && valor !== "TODOS" && !permitidos.includes(valor)) {
+        poblarSelectorSegmentos();
+        crearEncabezado(); crearTabla(); actualizarDashboard();
+        return;
+    }
+    filtroSegmento = valor || "TODOS";
+    crearEncabezado(); crearTabla(); actualizarDashboard();
+}
 function actualizarDashboard(){
-    let filtro = document.getElementById("filtroProducto")?.value || "TODOS"; let opsActivos = operadores.filter(op => mostrarBajas ? op.activo === false : op.activo !== false); let domTotalOp = document.getElementById("totalOperadores"); if(domTotalOp) domTotalOp.innerText = opsActivos.length; let domTotalCu = document.getElementById("totalCursos"); if(domTotalCu) domTotalCu.innerText = cursos.length;
-    let total = 0, completos = 0, enProceso = 0, pendientes = 0; if (filtro === "TODOS") { total = opsActivos.length * cursos.length; opsActivos.forEach(op => { cursos.forEach(c => { let est = op.estados[c]?.estado || "rojo"; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }); } else { total = opsActivos.length; opsActivos.forEach(op => { let est = op.estados[filtro]?.estado || "rojo"; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }
+    let filtro = document.getElementById("filtroProducto")?.value || "TODOS"; let opsActivos = operadores.filter(op => (mostrarBajas ? op.activo === false : op.activo !== false) && pasaFiltroSegmento(op)); let domTotalOp = document.getElementById("totalOperadores"); if(domTotalOp) domTotalOp.innerText = opsActivos.length; let domTotalCu = document.getElementById("totalCursos"); if(domTotalCu) domTotalCu.innerText = cursos.length;
+    let total = 0, completos = 0, enProceso = 0, pendientes = 0; if (filtro === "TODOS") { opsActivos.forEach(op => { cursos.forEach(c => { let est = estadoEfectivo(op, c); if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }); } else { opsActivos.forEach(op => { let est = estadoEfectivo(op, filtro); if (est === "noaplica") return; total++; if (est === "verde") completos++; else if (est === "amarillo") enProceso++; else pendientes++; }); }
     let domCob = document.getElementById("cobertura"); if(domCob) domCob.innerText = (total > 0 ? Math.round((completos / total) * 100) : 0) + "%"; let ctx = document.getElementById("grafico"); if(ctx) { if(chart) chart.destroy(); chart = new Chart(ctx, { type: "doughnut", data: { labels: ["Capacitados (Verde)", "En proceso (Amarillo)", "Pendientes (Rojo)"], datasets: [{ data: [completos, enProceso, pendientes], backgroundColor: ["#2ecc71", "#f1c40f", "#e74c3c"] }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { title: { display: true, text: filtro === "TODOS" ? "Métricas Generales" : `Métricas de: ${filtro}`, font: { size: 16 } } } } }); }
 }
 
 /* -------------------- 📈 TABLERO JEFATURA (CON GRUPOS DE TRATAMIENTO Y EXCEL) -------------------- */
+// Dibuja el buscador "¿quiénes faltan?" arriba del tablero (una sola vez)
+function renderizarBuscadorPendientes() {
+    let vista = document.getElementById('vista-tablero');
+    if (!vista) return;
+    if (document.getElementById('buscador-pendientes')) { poblarSelectProductoPend(); return; }
+
+    let cont = document.createElement('div');
+    cont.id = 'buscador-pendientes';
+    cont.style.cssText = 'background:white;border-radius:8px;box-shadow:0 4px 6px rgba(0,0,0,0.05);padding:20px;margin:20px;';
+    cont.innerHTML = `
+        <h3 style="color:#1f497d;margin:0 0 15px 0;"><i class="fa-solid fa-user-magnifying-glass"></i> ¿Quiénes faltan capacitar?</h3>
+        <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:end;margin-bottom:15px;">
+            <div>
+                <label style="font-size:12px;color:#555;display:block;margin-bottom:3px;">Producto</label>
+                <select id="pend-producto" onchange="actualizarListaPendientes()" style="padding:8px;border-radius:5px;min-width:200px;"></select>
+            </div>
+            <div>
+                <label style="font-size:12px;color:#555;display:block;margin-bottom:3px;">Estado</label>
+                <select id="pend-estado" onchange="actualizarListaPendientes()" style="padding:8px;border-radius:5px;">
+                    <option value="rojo">🔴 Pendiente</option>
+                    <option value="amarillo">🟡 En proceso</option>
+                    <option value="verde">🟢 Capacitado</option>
+                    <option value="noaplica">🚫 No aplica</option>
+                </select>
+            </div>
+            <div>
+                <label style="font-size:12px;color:#555;display:block;margin-bottom:3px;">Segmento</label>
+                <select id="pend-segmento" onchange="actualizarListaPendientes()" style="padding:8px;border-radius:5px;">
+                    <option value="TODOS">Todos</option>
+                    <option value="Operador">Operadores</option>
+                    <option value="Líder">Líderes</option>
+                    <option value="Supervisor">Supervisores</option>
+                    <option value="Analista">Analistas</option>
+                </select>
+            </div>
+        </div>
+        <div id="pend-resultado"></div>`;
+    // Insertar al principio del tablero
+    vista.insertBefore(cont, vista.firstChild);
+    poblarSelectProductoPend();
+    actualizarListaPendientes();
+}
+
+function poblarSelectProductoPend() {
+    let sel = document.getElementById('pend-producto');
+    if (!sel) return;
+    let actual = sel.value;
+    sel.innerHTML = cursos.map(c => `<option value="${c}">${c}</option>`).join('');
+    if (actual && cursos.includes(actual)) sel.value = actual;
+}
+
+// Arma la lista de operadores según producto + estado + segmento
+function actualizarListaPendientes() {
+    let producto = document.getElementById('pend-producto')?.value;
+    let estado = document.getElementById('pend-estado')?.value;
+    let segFiltro = document.getElementById('pend-segmento')?.value || 'TODOS';
+    let cont = document.getElementById('pend-resultado');
+    if (!cont || !producto) return;
+
+    let opsActivos = operadores.filter(op => op.activo !== false);
+    let lista = opsActivos.filter(op => {
+        if (segFiltro !== 'TODOS' && segmentoDe(op) !== segFiltro) return false;
+        let estOp = estadoEfectivo(op, producto);
+        return estOp === estado;
+    });
+    lista.sort((a, b) => a.nombre.localeCompare(b.nombre));
+
+    let estLabel = { rojo: 'pendientes', amarillo: 'en proceso', verde: 'capacitados', noaplica: 'con "No Aplica"' }[estado];
+    if (lista.length === 0) {
+        cont.innerHTML = `<p style="color:#7f8c8d;padding:10px;">No hay operadores ${estLabel} en <b>${producto}</b>${segFiltro !== 'TODOS' ? ' (segmento ' + segFiltro + ')' : ''}.</p>`;
+        return;
+    }
+
+    let filas = lista.map(op => `<tr style="border-bottom:1px solid #eee;">
+        <td style="padding:8px;text-align:left;">${op.nombre}</td>
+        <td style="padding:8px;text-align:center;">${op.area || '---'}</td>
+        <td style="padding:8px;text-align:center;">${segmentoDe(op)}</td></tr>`).join('');
+
+    cont.innerHTML = `
+        <p style="font-size:13px;color:#333;margin:5px 0 10px 0;"><b>${lista.length}</b> operador(es) ${estLabel} en <b>${producto}</b>${segFiltro !== 'TODOS' ? ' — segmento ' + segFiltro : ''}:</p>
+        <div style="max-height:320px;overflow-y:auto;border:1px solid #ecf0f1;border-radius:5px;">
+            <table style="width:100%;border-collapse:collapse;font-size:13px;">
+                <thead style="position:sticky;top:0;background:#2c3e50;color:white;">
+                    <tr><th style="padding:10px;text-align:left;">Operador</th><th style="padding:10px;">Grupo</th><th style="padding:10px;">Segmento</th></tr>
+                </thead>
+                <tbody>${filas}</tbody>
+            </table>
+        </div>`;
+}
+
 function actualizarTableroJefatura() {
+    // Buscador "quiénes faltan" por producto + estado (pedido de jefatura)
+    renderizarBuscadorPendientes();
     let totalNotas = 0; let cantidadNotas = 0; let notasAprobadas = 0; let notasDesaprobadas = 0; let notasCriticas = 0; let opsActivos = operadores.filter(op => op.activo !== false);
     
-    opsActivos.forEach(op => { cursos.forEach(c => { if(op.estados && op.estados[c] && op.estados[c].historial) { op.estados[c].historial.forEach(h => { if(h.porcentaje !== undefined && h.porcentaje !== "" && h.porcentaje !== "N/A") { let nota = parseInt(h.porcentaje); totalNotas += nota; cantidadNotas++; 
+    opsActivos.forEach(op => { cursos.forEach(c => { if(op.estados && op.estados[c] && op.estados[c].historial) { op.estados[c].historial.forEach(h => { if(h.porcentaje !== undefined && h.porcentaje !== "" && h.porcentaje !== "N/A") { let nota = parseInt(h.porcentaje); if(nota >= 0 && nota <= 100) { totalNotas += nota; cantidadNotas++; } 
         if(nota >= 85) notasAprobadas++; else if(nota >= 70) notasDesaprobadas++; else notasCriticas++; 
     } }); } }); });
     
@@ -193,16 +815,18 @@ function actualizarTableroJefatura() {
         htmlTabla += `</tr></thead><tbody>`;
 
         cursos.forEach(curso => {
-            let capacitadosGlobal = opsActivos.filter(op => op.estados[curso] && op.estados[curso].estado === 'verde').length;
-            let percGlobal = opsActivos.length > 0 ? Math.round((capacitadosGlobal / opsActivos.length) * 100) : 0;
+            let aplicaGlobal = opsActivos.filter(op => estadoEfectivo(op, curso) !== 'noaplica');
+            let capacitadosGlobal = aplicaGlobal.filter(op => estadoEfectivo(op, curso) === 'verde').length;
+            let totalGlobal = aplicaGlobal.length;
+            let percGlobal = totalGlobal > 0 ? Math.round((capacitadosGlobal / totalGlobal) * 100) : 0;
             let colorGlobal = percGlobal >= 85 ? '#27ae60' : (percGlobal >= 70 ? '#f39c12' : '#c0392b');
 
-            htmlTabla += `<tr style="border-bottom: 1px solid #ecf0f1; transition: background 0.2s;" onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background='transparent'"><td style="padding: 10px; text-align: left; font-weight: bold; color: #34495e; border-right: 1px solid #ecf0f1;">${curso}</td><td style="padding: 10px; font-weight: bold; color: ${colorGlobal}; background: #fdfefe; border-right: 1px solid #ecf0f1;">${percGlobal}% <br><span style="font-size:10px; color:#7f8c8d;">(${capacitadosGlobal}/${opsActivos.length} ops)</span></td>`;
+            htmlTabla += `<tr style="border-bottom: 1px solid #ecf0f1; transition: background 0.2s;" onmouseover="this.style.background='#f8f9fa'" onmouseout="this.style.background='transparent'"><td style="padding: 10px; text-align: left; font-weight: bold; color: #34495e; border-right: 1px solid #ecf0f1;">${curso}</td><td style="padding: 10px; font-weight: bold; color: ${colorGlobal}; background: #fdfefe; border-right: 1px solid #ecf0f1;">${percGlobal}% <br><span style="font-size:10px; color:#7f8c8d;">(${capacitadosGlobal}/${totalGlobal} ops)</span></td>`;
 
             areas.forEach(area => {
-                let opsArea = opsActivos.filter(op => (op.area || 'Sin Asignar') === area);
+                let opsArea = opsActivos.filter(op => (op.area || 'Sin Asignar') === area && estadoEfectivo(op, curso) !== 'noaplica');
                 let totalArea = opsArea.length;
-                let capacitadosArea = opsArea.filter(op => op.estados[curso] && op.estados[curso].estado === 'verde').length;
+                let capacitadosArea = opsArea.filter(op => estadoEfectivo(op, curso) === 'verde').length;
                 let percArea = totalArea > 0 ? Math.round((capacitadosArea / totalArea) * 100) : 0;
                 let colorArea = percArea >= 85 ? '#27ae60' : (percArea >= 70 ? '#f39c12' : '#c0392b');
                 htmlTabla += `<td style="padding: 10px; color: ${colorArea}; font-weight: bold;">${percArea}% <br><span style="font-size:10px; color:#7f8c8d;">(${capacitadosArea}/${totalArea} ops)</span></td>`;
@@ -244,6 +868,50 @@ function descargarReporteJefaturaExcel() {
 }
 
 /* -------------------- 🗄️ ARCHIVO DE BAJAS Y ESPÍA -------------------- */
+
+// 🧹 Limpieza única de duplicados históricos (mismo curso+tipo+fecha+porcentaje en un operador).
+// Deja el primero de cada grupo y descarta el resto. Muestra cuántos limpió.
+async function limpiarDuplicadosHistorial() {
+    const { isConfirmed } = await Swal.fire({
+        title: '¿Limpiar duplicados?',
+        html: 'Va a recorrer toda la matriz y eliminar registros repetidos (mismo curso, tipo, fecha y nota) dejando uno solo.<br><br><b>Se descarga un backup automático antes.</b>',
+        icon: 'warning', showCancelButton: true, confirmButtonColor: '#c0392b',
+        confirmButtonText: 'Sí, limpiar', cancelButtonText: 'Cancelar'
+    });
+    if (!isConfirmed) return;
+
+    // backup preventivo
+    try {
+        let blob = new Blob([JSON.stringify({ operadores, sesiones, actividades, historialAuditoria }, null, 2)], { type: 'application/json' });
+        let a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+        a.download = `backup_antes_limpieza_${new Date().toISOString().split('T')[0]}.json`; a.click();
+    } catch (e) { /* si falla el backup, seguimos igual con confirmación abajo */ }
+
+    const soloDia = (f) => f ? String(f).split(' ')[0].trim() : '';
+    const normPct = (p) => (p === null || p === undefined || p === '' || String(p).toUpperCase() === 'N/A') ? 'N/A' : String(p).replace('%', '').trim();
+    let eliminados = 0;
+
+    operadores.forEach(op => {
+        if (!op.estados) return;
+        Object.keys(op.estados).forEach(curso => {
+            let h = op.estados[curso] && op.estados[curso].historial;
+            if (!Array.isArray(h)) return;
+            let vistos = new Set();
+            let limpio = [];
+            h.forEach(reg => {
+                let huella = `${reg.tipo}|${soloDia(reg.fecha)}|${normPct(reg.porcentaje)}`;
+                if (vistos.has(huella)) { eliminados++; return; }
+                vistos.add(huella); limpio.push(reg);
+            });
+            op.estados[curso].historial = limpio;
+        });
+    });
+
+    registrarAccion(`Limpieza de duplicados: eliminó ${eliminados} registros repetidos`);
+    guardarDatos(); crearTabla(); actualizarDashboard();
+    Swal.fire('Listo', `Se eliminaron <b>${eliminados}</b> registros duplicados.`, 'success');
+}
+
 function alternarBajas() {
     mostrarBajas = !mostrarBajas;
     let btn = document.getElementById("btnVerBajas");
@@ -257,9 +925,9 @@ function alternarBajas() {
     crearEncabezado(); crearTabla(); actualizarDashboard();
 }
 
-async function darDeBaja(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Archivar a ${nombre}?`, text: "Pasará a la pestaña de Bajas.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#e67e22', confirmButtonText: 'Sí, archivar' }); if (isConfirmed) { let op = operadores.find(o => o.nombre === nombre); if (op) { op.activo = false; registrarAccion(`Archivó/Dio de baja al operador: ${nombre}`); guardarDatos(); } } }
-async function darDeAlta(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Reincorporar a ${nombre}?`, text: "Volverá a aparecer en la matriz principal.", icon: 'info', showCancelButton: true, confirmButtonColor: '#27ae60', confirmButtonText: 'Sí, reincorporar' }); if (isConfirmed) { let op = operadores.find(o => o.nombre === nombre); if (op) { op.activo = true; registrarAccion(`Reincorporó (Alta) al operador: ${nombre}`); guardarDatos(); } } }
-async function eliminarDefinitivo(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Eliminar a ${nombre} PARA SIEMPRE?`, text: "Se borrará todo su historial.", icon: 'error', showCancelButton: true, confirmButtonColor: '#c0392b', confirmButtonText: 'Eliminar definitivamente' }); if (isConfirmed) { operadores = operadores.filter(op => op.nombre !== nombre); registrarAccion(`Eliminó de forma definitiva al operador: ${nombre}`); guardarDatos(); } }
+async function darDeBaja(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Archivar a ${nombre}?`, text: "Pasará a la pestaña de Bajas.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#e67e22', confirmButtonText: 'Sí, archivar' }); if (isConfirmed) { let op = operadores.find(o => o.nombre === nombre); if (op) { op.activo = false; registrarAccion(`Archivó/Dio de baja al operador: ${nombre}`); guardarDatos(); crearTabla(); actualizarDashboard(); } } }
+async function darDeAlta(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Reincorporar a ${nombre}?`, text: "Volverá a aparecer en la matriz principal.", icon: 'info', showCancelButton: true, confirmButtonColor: '#27ae60', confirmButtonText: 'Sí, reincorporar' }); if (isConfirmed) { let op = operadores.find(o => o.nombre === nombre); if (op) { op.activo = true; registrarAccion(`Reincorporó (Alta) al operador: ${nombre}`); guardarDatos(); crearTabla(); actualizarDashboard(); } } }
+async function eliminarDefinitivo(nombre) { const { isConfirmed } = await Swal.fire({ title: `¿Eliminar a ${nombre} PARA SIEMPRE?`, text: "Se borrará todo su historial.", icon: 'error', showCancelButton: true, confirmButtonColor: '#c0392b', confirmButtonText: 'Eliminar definitivamente' }); if (isConfirmed) { operadores = operadores.filter(op => op.nombre !== nombre); registrarAccion(`Eliminó de forma definitiva al operador: ${nombre}`); guardarDatos(); crearTabla(); actualizarDashboard(); } }
 
 function verHistorialAuditoria() {
     let html = '<div style="max-height: 400px; overflow-y: auto; text-align: left; font-size: 13px; background: #f8f9fa; padding: 10px; border-radius: 5px; border: 1px solid #ccc;">';
@@ -272,11 +940,11 @@ function verHistorialAuditoria() {
 /* -------------------- ENCABEZADO Y TABLA (CON N/A Y COLORES) -------------------- */
 function crearEncabezado(){
     let tituloAccion = mostrarBajas ? "Acciones" : "Archivar"; let colEliminar = modoEdicion ? `<th>${tituloAccion}</th>` : ``;
-    encabezado.innerHTML = `<th>Operador</th><th>Área</th>${colEliminar}`; cursos.forEach(curso => { encabezado.innerHTML += `<th>${curso}</th>`; });
+    encabezado.innerHTML = `<th>Operador</th><th>Segmento</th><th>Área</th><th title="Carpeta de evaluaciones">📁</th>${colEliminar}`; cursos.forEach(curso => { encabezado.innerHTML += `<th>${curso}</th>`; });
 }
 
 function crearTabla(){
-    let fragmento = ""; let opsAMostrar = operadores.filter(op => mostrarBajas ? op.activo === false : op.activo !== false);
+    let fragmento = ""; let opsAMostrar = operadores.filter(op => (mostrarBajas ? op.activo === false : op.activo !== false) && pasaFiltroSegmento(op));
 
     opsAMostrar.forEach(op => {
         let claseArea = "area-vacia"; let textoArea = "---";
@@ -285,16 +953,22 @@ function crearTabla(){
         let celdaEliminar = "";
         if (modoEdicion) {
             if (mostrarBajas) { celdaEliminar = `<td style="text-align: center; min-width: 70px;"><button onclick="darDeAlta('${op.nombre}')" style="background:transparent; border:none; color:#27ae60; cursor:pointer; font-size:16px;" title="Reincorporar"><i class="fa-solid fa-rotate-left"></i></button><button onclick="eliminarDefinitivo('${op.nombre}')" style="background:transparent; border:none; color:#c0392b; cursor:pointer; font-size:16px; margin-left:10px;" title="Eliminar Permanente"><i class="fa-solid fa-trash"></i></button></td>`; } 
-            else { celdaEliminar = `<td style="text-align: center;"><button onclick="darDeBaja('${op.nombre}')" style="background:transparent; border:none; color:#e67e22; cursor:pointer; font-size:16px;" title="Archivar Operador"><i class="fa-solid fa-box-archive"></i></button></td>`; }
+            else { celdaEliminar = `<td style="text-align: center;"><button onclick="darDeBaja('${op.nombre}')" style="background:transparent; border:none; color:#e67e22; cursor:pointer; font-size:15px;" title="Archivar Operador"><i class="fa-solid fa-box-archive"></i></button></td>`; }
         }
 
         let clickArea = modoEdicion ? `onclick="asignarArea('${op.nombre}')"` : ``;
-        let fila = `<tr><td style="cursor: pointer; color: #2980b9; text-decoration: underline; font-weight: bold;" onclick="verEstadisticas('${op.nombre}')"><i class="fa-solid fa-user-chart"></i> ${op.nombre}</td><td style="text-align: center;"><span class="badge-area ${claseArea}" ${clickArea}>${textoArea}</span></td>${celdaEliminar}`; 
+        let clickSeg = modoEdicion ? `onclick="asignarSegmento('${op.nombre}')"` : ``;
+        let seg = segmentoDe(op);
+        let celdaSegmento = `<td style="text-align: center;"><span ${clickSeg} style="display:inline-block; background:#eaf2fb; color:#1a5fa5; font-size:11px; font-weight:bold; padding:3px 8px; border-radius:10px; cursor:${modoEdicion ? 'pointer' : 'default'};">${seg}</span></td>`;
+        let celdaCarpeta = `<td style="text-align: center;"><button onclick="abrirCarpetaOperador('${op.nombre}')" style="background:transparent; border:none; color:#2980b9; cursor:pointer; font-size:15px;" title="Carpeta de evaluaciones"><i class="fa-solid fa-folder-open"></i></button></td>`;
+            let fila = `<tr><td style="cursor: pointer; color: #2980b9; text-decoration: underline; font-weight: bold;" onclick="verEstadisticas('${op.nombre}')"><i class="fa-solid fa-user-chart"></i> ${op.nombre}</td>${celdaSegmento}<td style="text-align: center;"><span class="badge-area ${claseArea}" ${clickArea}>${textoArea}</span></td>${celdaCarpeta}${celdaEliminar}`; 
 
         cursos.forEach(curso => {
             let info = op.estados[curso] || { estado: "rojo", historial: [] }; if (!info.historial) info.historial = []; let lineasInfo = [];
+            // Estado de VISTA: si el producto no aplica al área del operador, se muestra N/A (regla automática)
+            let estadoVista = noAplicaPorArea(op, curso) ? "noaplica" : info.estado;
 
-            if (info.historial.length > 0) { 
+            if (estadoVista !== "noaplica" && info.historial.length > 0) { 
                 info.historial.forEach(evento => { 
                     let fechaVisual = "";
                     if(evento.fecha){ let partes = evento.fecha.split(' '); let soloFecha = partes[0]; let soloHora = partes[1] ? ` ${partes[1]} hs` : ""; fechaVisual = soloFecha.split('-').reverse().join('/') + soloHora; }
@@ -304,21 +978,25 @@ function crearTabla(){
                     
                     if (evento.porcentaje === "N/A" || evento.porcentaje === undefined || evento.porcentaje === "") { txt += `<br><span style="display: inline-block; margin-top: 5px; font-size: 1.2em; color: #7f8c8d; font-weight: bold;">(N/A)</span>`; } 
                     else {
-                        let num = parseInt(evento.porcentaje); let colorBadge = "#16a085"; 
+                        let num = parseInt(evento.porcentaje); let esKahoot = num > 100; let colorBadge = "#16a085"; 
                         if (num >= 85) colorBadge = "#27ae60"; else if (num >= 70) colorBadge = "#f39c12"; else colorBadge = "#c0392b"; 
-                        txt += `<br><span style="display: inline-block; margin-top: 5px; font-size: 1.3em; color: ${colorBadge}; font-weight: 900;">💯 ${evento.porcentaje}%</span>`; 
+                        txt += `<br><span style="display: inline-block; margin-top: 5px; font-size: 1.3em; color: ${colorBadge}; font-weight: 900;">${esKahoot ? "🎮 "+evento.porcentaje+" pts" : "💯 "+evento.porcentaje+"%"}</span>`; 
                     }
                     lineasInfo.push(txt); 
                 }); 
-            } else if (info.estado === "amarillo") { lineasInfo.push("<i>En capacitación</i>"); }
+            } else if (estadoVista === "amarillo") { lineasInfo.push("<i>En capacitación</i>"); }
+            else if (estadoVista === "noaplica") { lineasInfo.push("<i>No aplica a este grupo</i>"); }
             
             let clickCelda = (modoEdicion && !mostrarBajas) ? `onclick="cargarCapacitacion('${op.nombre}', '${curso}')"` : `style="cursor: default;"`;
-            fila += `<td ${clickCelda}><span class="estado ${info.estado}"></span><div class="miniInfo">${lineasInfo.join("<hr style='margin: 4px 0; border: 0; border-top: 1px dashed #ccc;'>")}</div></td>`;
+            let contenidoCelda = estadoVista === "noaplica"
+                ? `<span style="display:inline-block;background:#bdc3c7;color:#555;font-size:10px;font-weight:bold;padding:2px 6px;border-radius:8px;">N/A</span>`
+                : `<span class="estado ${estadoVista}"></span>`;
+            fila += `<td ${clickCelda}>${contenidoCelda}<div class="miniInfo">${lineasInfo.join("<hr style='margin: 4px 0; border: 0; border-top: 1px dashed #ccc;'>")}</div></td>`;
         });
         fila += "</tr>"; fragmento += fila;
     });
     
-    if (opsAMostrar.length === 0) { let colSpan = cursos.length + (modoEdicion ? 3 : 2); fragmento = `<tr><td colspan="${colSpan}" style="text-align:center; padding: 20px; color:#7f8c8d;">No hay operadores en esta lista.</td></tr>`; }
+    if (opsAMostrar.length === 0) { let colSpan = cursos.length + (modoEdicion ? 4 : 3); fragmento = `<tr><td colspan="${colSpan}" style="text-align:center; padding: 20px; color:#7f8c8d;">No hay personas en esta vista.</td></tr>`; }
     tabla.innerHTML = fragmento;
 }
 
@@ -327,11 +1005,11 @@ async function asignarArea(nombre) { let op = operadores.find(o => o.nombre === 
 /* -------------------- 🎨 CARGA DE CAPACITACIÓN EN MATRIZ -------------------- */
 async function cargarCapacitacion(nombre, cursoNombre){
     let op = operadores.find(o => o.nombre === nombre); if (!op) return; let info = op.estados[cursoNombre] || { estado: "rojo", historial: [] }; if (!info.historial) info.historial = [];
-    let validosCE = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("CE")); let validosCR = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("CR"));
+    let validosCE = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("CE")); let validosCR = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("CR")); let validosVA = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("VA")); let validosVRS = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("VRS")); let validosEI = Object.keys(mapaCodigos).filter(key => mapaCodigos[key] === cursoNombre && key.startsWith("EI"));
 
     const { value: accion } = await Swal.fire({ 
         title: cursoNombre, text: `Editando a: ${nombre}`, input: 'select', 
-        inputOptions: { '1': '🟡 Marcar "En capacitación"', '2': '🟢 Cargar Entrenamiento (CE)', '3': '🟢 Cargar Re-entrenamiento (CR)', '6': '🟢 Cargar Entrenamiento Inicial (EI)', '4': '🔵 Cargar Verificación Anual (VA)', '7': '🔵 Cargar Verif. Requerimiento (VRS)', '8': '✏️ EDITAR Nota/Fecha existente', '9': '🗑️ BORRAR un registro específico', '5': '🔴 BORRAR historial completo' }, showCancelButton: true 
+        inputOptions: { '1': '🟡 Marcar "En capacitación"', '2': '🟢 Cargar Entrenamiento (CE)', '3': '🟢 Cargar Re-entrenamiento (CR)', '6': '🟢 Cargar Entrenamiento Inicial (EI)', '4': '🔵 Cargar Verificación Anual (VA)', '7': '🔵 Cargar Verif. Requerimiento (VRS)', '10': '🚫 Marcar "No Aplica"', '8': '✏️ EDITAR Nota/Fecha existente', '9': '🗑️ BORRAR un registro específico', '5': '🔴 BORRAR historial completo' }, showCancelButton: true 
     });
 
     if (accion === '8') { editarHistorialCapacitacion(nombre, cursoNombre); return; }
@@ -339,6 +1017,14 @@ async function cargarCapacitacion(nombre, cursoNombre){
     if (!accion) return; let fechaHoy = new Date().toISOString().split('T')[0]; let guardadoExitoso = false; let textoEspia = "";
 
     if (accion === '1') { info.estado = "amarillo"; guardadoExitoso = true; textoEspia = `Marcó "En Capacitación" a ${nombre} en ${cursoNombre}`; }
+    else if (accion === '10') {
+        // Si ya estaba en No Aplica, permite revertir a pendiente
+        if (info.estado === "noaplica") {
+            info.estado = "rojo"; guardadoExitoso = true; textoEspia = `Quitó "No Aplica" a ${nombre} en ${cursoNombre} (vuelve a pendiente)`;
+        } else {
+            info.estado = "noaplica"; guardadoExitoso = true; textoEspia = `Marcó "No Aplica" a ${nombre} en ${cursoNombre}`;
+        }
+    }
     else if (accion === '2' || accion === '3') {
         let tipo = accion === '2' ? 'CE' : 'CR'; let permitidos = accion === '2' ? validosCE : validosCR;
         const { value: inputCodigo } = await Swal.fire({ 
@@ -372,8 +1058,8 @@ async function cargarCapacitacion(nombre, cursoNombre){
         info.estado = "verde"; guardadoExitoso = true; textoEspia = `Cargó ${tipo} (${porcentajeFinal !== "N/A" ? porcentajeFinal+"%" : "N/A"}) a ${nombre} en ${cursoNombre}`;
     }
     else if (accion === '4' || accion === '6' || accion === '7') {
-        let tipoNombre = accion === '4' ? 'VA' : (accion === '6' ? 'EI' : 'VRS');
-        const { value: fechaVerif } = await Swal.fire({ title: `Fecha`, input: 'date', inputValue: fechaHoy, showCancelButton: true }); if (!fechaVerif) return; 
+        let tipoNombre = accion === '4' ? 'VA' : (accion === '6' ? 'EI' : 'VRS'); let validosTipo = accion === '4' ? validosVA : (accion === '6' ? validosEI : validosVRS); let codigoTipo = validosTipo.length > 0 ? validosTipo[0] : "";
+        const { value: fechaVerif } = await Swal.fire({ title: `Código ${tipoNombre}`, text: codigoTipo ? `Código asignado: ${codigoTipo}` : 'Sin código asignado para este producto', input: 'date', inputLabel: 'Fecha', inputValue: fechaHoy, showCancelButton: true }); if (!fechaVerif) return; 
         
         const { value: porcentajeVerif } = await Swal.fire({ 
             title: 'Nota %', 
@@ -390,7 +1076,7 @@ async function cargarCapacitacion(nombre, cursoNombre){
         }); 
         if (porcentajeVerif === undefined) return;
 
-        info.historial.push({ tipo: tipoNombre, codigo: "", fecha: fechaVerif, porcentaje: porcentajeVerif }); 
+        info.historial.push({ tipo: tipoNombre, codigo: codigoTipo, fecha: fechaVerif, porcentaje: porcentajeVerif }); 
         info.estado = "verde"; guardadoExitoso = true; textoEspia = `Cargó ${tipoNombre} (${porcentajeVerif !== "N/A" ? porcentajeVerif+"%" : "N/A"}) a ${nombre} en ${cursoNombre}`;
     }
     else if (accion === '5') {
@@ -419,7 +1105,9 @@ async function eliminarRegistroCapacitacion(nombre, cursoNombre) {
     }
 }
 
-async function agregarOperador(){ const { value: nombre } = await Swal.fire({ title: 'Nuevo Operador', input: 'text', showCancelButton: true }); if (nombre) { operadores.push({ nombre: nombre.trim().toUpperCase(), area: "", estados: {}, activo: true }); registrarAccion(`Agregó un nuevo operador: ${nombre.trim().toUpperCase()}`); guardarDatos(); } }
+async function agregarOperador(){ const { value: formValues } = await Swal.fire({ title: 'Nueva Persona', html: `<input id="swal-nombre-op" class="swal2-input" placeholder="Nombre y Apellido"><select id="swal-segmento-op" class="swal2-select" style="width:100%; padding:8px; margin-top:10px;">${SEGMENTOS.map(s => `<option value="${s}">${s}</option>`).join('')}</select>`, showCancelButton: true, preConfirm: () => { let nombre = document.getElementById('swal-nombre-op').value.trim(); if (!nombre) { Swal.showValidationMessage('Ingresá un nombre'); return false; } return { nombre: nombre.toUpperCase(), segmento: document.getElementById('swal-segmento-op').value }; } }); if (formValues) { operadores.push({ nombre: formValues.nombre, area: "", segmento: formValues.segmento, estados: {}, activo: true }); registrarAccion(`Agregó ${formValues.segmento}: ${formValues.nombre}`); guardarDatos(); crearTabla(); actualizarDashboard(); } }
+
+async function asignarSegmento(nombre) { let op = operadores.find(o => o.nombre === nombre); if (!op) return; const { value: seg } = await Swal.fire({ title: 'Asignar Segmento', input: 'select', inputValue: segmentoDe(op), inputOptions: Object.fromEntries(SEGMENTOS.map(s => [s, s])), showCancelButton: true }); if (seg !== undefined) { op.segmento = seg; registrarAccion(`Asignó el segmento ${seg} a ${nombre}`); guardarDatos(); crearTabla(); actualizarDashboard(); } }
 
 async function editarHistorialCapacitacion(nombre, cursoNombre) {
     let op = operadores.find(o => o.nombre === nombre); if (!op || !op.estados[cursoNombre]) return;
@@ -456,7 +1144,45 @@ if(buscador) { buscador.addEventListener("input", function(){ let texto = this.v
 
 async function agregarProducto() { const { value: formValues } = await Swal.fire({ title: 'Nuevo Producto', html: '<input id="swal-input1" class="swal2-input" placeholder="Nombre">' + '<input id="swal-input2" class="swal2-input" placeholder="Código">', focusConfirm: false, showCancelButton: true, preConfirm: () => { return { producto: document.getElementById('swal-input1').value.trim().toUpperCase(), codigo: document.getElementById('swal-input2').value.trim().toUpperCase() }; } }); if (formValues && formValues.producto) { mapaCodigos[formValues.codigo] = formValues.producto; registrarAccion(`Creó un nuevo producto: ${formValues.producto}`); guardarDatos(); } }
 
-async function gestionarProductos() { const { value: accion } = await Swal.fire({ title: 'Gestión', input: 'select', inputOptions: { 'eliminar': 'Eliminar Código', 'renombrar': 'Renombrar Producto' }, showCancelButton: true }); if (accion === 'eliminar') { const { value: codigo } = await Swal.fire({ title: 'Código', input: 'select', inputOptions: mapaCodigos, showCancelButton: true }); if (codigo) { registrarAccion(`Eliminó el código ${codigo} (${mapaCodigos[codigo]})`); delete mapaCodigos[codigo]; guardarDatos(); } } else if (accion === 'renombrar') { let opciones = {}; cursos.forEach(p => opciones[p] = p); const { value: viejo } = await Swal.fire({ title: 'Renombrar', input: 'select', inputOptions: opciones, showCancelButton: true }); if (viejo) { const { value: nuevo } = await Swal.fire({ title: `Nuevo nombre para ${viejo}`, input: 'text', showCancelButton: true }); if (nuevo) { let n = nuevo.trim().toUpperCase(); for (let code in mapaCodigos) { if (mapaCodigos[code] === viejo) mapaCodigos[code] = n; } operadores.forEach(op => { if (op.estados[viejo]) { op.estados[n] = op.estados[viejo]; delete op.estados[viejo]; } }); registrarAccion(`Renombró el producto ${viejo} a ${n}`); guardarDatos(); } } } }
+// Configura qué áreas (MDA/CR) NO aplican a cada producto
+async function configurarNoAplicaPorArea() {
+    // Áreas existentes en los operadores + las típicas
+    let areasSet = new Set(["MDA", "CR"]);
+    operadores.forEach(op => { if (op.area) areasSet.add(op.area); });
+    let areas = [...areasSet];
+
+    // Elegir producto
+    let opcProd = {}; cursos.slice().sort().forEach(c => opcProd[c] = c);
+    const { value: producto } = await Swal.fire({
+        title: '🚫 No Aplica por Área',
+        text: 'Elegí el producto a configurar',
+        input: 'select', inputOptions: opcProd, showCancelButton: true, confirmButtonText: 'Siguiente'
+    });
+    if (!producto) return;
+
+    let actuales = reglasNoAplica[producto] || [];
+    let checks = areas.map(a => `<label style="display:block;text-align:left;padding:6px 20px;font-size:15px;">
+        <input type="checkbox" class="na-area" value="${a}" ${actuales.includes(a) ? 'checked' : ''}> No aplica a <b>${a}</b>
+    </label>`).join('');
+
+    const { isConfirmed, value: sel } = await Swal.fire({
+        title: `${producto}`,
+        html: `<p style="font-size:13px;color:#555;">Tildá las áreas a las que <b>NO</b> corresponde este producto. Los operadores de esas áreas lo verán como "N/A" y saldrá de su cobertura.</p>${checks}`,
+        showCancelButton: true, confirmButtonText: 'Guardar',
+        preConfirm: () => Array.from(document.querySelectorAll('.na-area:checked')).map(c => c.value)
+    });
+    if (!isConfirmed) return;
+
+    // Guardamos: si no hay ninguna, borramos la regla del producto
+    if (!sel || sel.length === 0) delete reglasNoAplica[producto];
+    else reglasNoAplica[producto] = sel;
+
+    registrarAccion(`Configuró "No Aplica" de ${producto}: ${(sel && sel.length) ? sel.join(', ') : 'ninguna área'}`);
+    guardarDatos(); crearTabla(); actualizarDashboard();
+    Swal.fire('Guardado', `Regla de "${producto}" actualizada.`, 'success');
+}
+
+async function gestionarProductos() { const { value: accion } = await Swal.fire({ title: 'Gestión', input: 'select', inputOptions: { 'eliminar': 'Eliminar Código', 'renombrar': 'Renombrar Producto', 'noaplica': '🚫 Configurar "No Aplica" por Área' }, showCancelButton: true }); if (accion === 'noaplica') { await configurarNoAplicaPorArea(); return; } if (accion === 'eliminar') { const { value: codigo } = await Swal.fire({ title: 'Código', input: 'select', inputOptions: mapaCodigos, showCancelButton: true }); if (codigo) { registrarAccion(`Eliminó el código ${codigo} (${mapaCodigos[codigo]})`); delete mapaCodigos[codigo]; guardarDatos(); } } else if (accion === 'renombrar') { let opciones = {}; cursos.forEach(p => opciones[p] = p); const { value: viejo } = await Swal.fire({ title: 'Renombrar', input: 'select', inputOptions: opciones, showCancelButton: true }); if (viejo) { const { value: nuevo } = await Swal.fire({ title: `Nuevo nombre para ${viejo}`, input: 'text', showCancelButton: true }); if (nuevo) { let n = nuevo.trim().toUpperCase(); for (let code in mapaCodigos) { if (mapaCodigos[code] === viejo) mapaCodigos[code] = n; } operadores.forEach(op => { if (op.estados[viejo]) { op.estados[n] = op.estados[viejo]; delete op.estados[viejo]; } }); registrarAccion(`Renombró el producto ${viejo} a ${n}`); guardarDatos(); } } } }
 
 function verReporteCursos() { let reporte = []; let opsActivos = operadores.filter(op => op.activo !== false); cursos.forEach(curso => { let completados = 0; opsActivos.forEach(op => { if (op.estados[curso] && op.estados[curso].estado === "verde") completados++; }); reporte.push({ nombre: curso, cantidad: completados }); }); reporte.sort((a, b) => b.cantidad - a.cantidad); let htmlTabla = `<table style="width:100%; border-collapse:collapse; font-size:14px; text-align:left;"><tr style="background:#f2f2f2; border-bottom:2px solid #ccc;"><th style="padding:8px;">Producto</th><th style="padding:8px; text-align:center;">Capacitados (Activos)</th></tr>`; reporte.forEach(r => { htmlTabla += `<tr style="border-bottom:1px solid #eee;"><td style="padding:8px;">${r.nombre}</td><td style="padding:8px; text-align:center; font-weight:bold; color:${r.cantidad > 0 ? '#2ecc71' : '#e74c3c'}">${r.cantidad}</td></tr>`; }); htmlTabla += `</table>`; Swal.fire({ title: 'Reporte: Capacitados por Producto', html: `<div style="max-height: 400px; overflow-y: auto;">${htmlTabla}</div>`, width: '700px', confirmButtonColor: '#8e44ad', confirmButtonText: 'Cerrar reporte' }); }
 
@@ -466,12 +1192,12 @@ function accederManuales() { const RUTA_MANUALES = "\\\\central\\GDS\\Proyectos 
 
 /* -------------------- 📊 LIBRETA VIRTUAL Y ESTADÍSTICAS INDIVIDUALES -------------------- */
 function verEstadisticas(nombre) {
-    let op = operadores.find(o => o.nombre === nombre); if(!op) return; let completados = []; let enProceso = []; let faltantes = [];
-    cursos.forEach(c => { let est = op.estados && op.estados[c]?.estado || "rojo"; if (est === "verde") completados.push(c); else if (est === "amarillo") enProceso.push(c); else faltantes.push(c); }); let porcentaje = cursos.length > 0 ? Math.round((completados.length / cursos.length) * 100) : 0; let areaBadge = op.area ? `| Área: <b>${op.area}</b>` : ""; let estadoBadge = op.activo === false ? `<br><span style="color:#e74c3c; font-size:14px;">[Operador Inactivo / Archivado]</span>` : '';
+    let op = operadores.find(o => o.nombre === nombre); if(!op) return; let completados = []; let enProceso = []; let faltantes = []; let noAplica = [];
+    cursos.forEach(c => { let est = estadoEfectivo(op, c); if (est === "verde") completados.push(c); else if (est === "amarillo") enProceso.push(c); else if (est === "noaplica") noAplica.push(c); else faltantes.push(c); }); let baseCursos = cursos.length - noAplica.length; let porcentaje = baseCursos > 0 ? Math.round((completados.length / baseCursos) * 100) : 0; let areaBadge = op.area ? `| Área: <b>${op.area}</b>` : ""; let estadoBadge = op.activo === false ? `<br><span style="color:#e74c3c; font-size:14px;">[Operador Inactivo / Archivado]</span>` : '';
     
     let botonInforme = modoEdicion ? `<button onclick="emitirActaRefuerzo('${nombre}')" style="padding: 8px 15px; background-color: #1f497d; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-top: 10px;"><i class="fa-solid fa-file-excel"></i> Descargar Informe Oficial (Excel)</button>` : `<button onclick="emitirActaRefuerzo('${nombre}')" style="padding: 8px 15px; background-color: #8e44ad; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-top: 10px;"><i class="fa-solid fa-file-pdf"></i> Descargar Informe Específico (PDF)</button>`;
 
-    let htmlContent = `<div style="text-align: left; font-size: 14px;"><h2 style="text-align:center; color: #2ecc71;">Completitud: ${porcentaje}% ${areaBadge} ${estadoBadge}</h2><div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px dashed #bdc3c7;"><button onclick="copiarRutaCarpeta('${nombre}')" style="padding: 8px 15px; background-color: #34495e; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-bottom: 10px;"><i class="fa-regular fa-copy"></i> Copiar Ruta de Exámenes en Red</button><button onclick="descargarBoletinPDF('${nombre}')" style="padding: 8px 15px; background-color: #c0392b; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s;"><i class="fa-solid fa-file-pdf"></i> Descargar Libreta PDF General</button>${botonInforme}</div><hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;"><h4 style="color:#2ecc71; margin-bottom: 5px;">✅ Completados (${completados.length}):</h4><p style="font-size:12px; margin-top: 0;">${completados.join(' | ') || 'Ninguno'}</p><h4 style="color:#f1c40f; margin-bottom: 5px;">⏳ En Proceso (${enProceso.length}):</h4><p style="font-size:12px; margin-top: 0;">${enProceso.join(' | ') || 'Ninguno'}</p><h4 style="color:#e74c3c; margin-bottom: 5px;">❌ Pendientes (${faltantes.length}):</h4><p style="font-size:12px; margin-top: 0;">${faltantes.join(' | ') || 'Ninguno'}</p></div>`; 
+    let htmlContent = `<div style="text-align: left; font-size: 14px;"><h2 style="text-align:center; color: #2ecc71;">Completitud: ${porcentaje}% ${areaBadge} ${estadoBadge}</h2><div style="background-color: #f8f9fa; padding: 15px; border-radius: 8px; margin-top: 15px; text-align: center; border: 1px dashed #bdc3c7;"><button onclick="copiarRutaCarpeta('${nombre}')" style="padding: 8px 15px; background-color: #34495e; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s; margin-bottom: 10px;"><i class="fa-regular fa-copy"></i> Copiar Ruta de Exámenes en Red</button><button onclick="descargarBoletinPDF('${nombre}')" style="padding: 8px 15px; background-color: #c0392b; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: bold; width: 100%; transition: background 0.3s;"><i class="fa-solid fa-file-pdf"></i> Descargar Libreta PDF General</button>${botonInforme}</div><hr style="margin: 20px 0; border: 0; border-top: 1px solid #eee;"><h4 style="color:#2ecc71; margin-bottom: 5px;">✅ Completados (${completados.length}):</h4><p style="font-size:12px; margin-top: 0;">${completados.join(' | ') || 'Ninguno'}</p><h4 style="color:#f1c40f; margin-bottom: 5px;">⏳ En Proceso (${enProceso.length}):</h4><p style="font-size:12px; margin-top: 0;">${enProceso.join(' | ') || 'Ninguno'}</p><h4 style="color:#e74c3c; margin-bottom: 5px;">❌ N/A para su grupo de tratamiento (${faltantes.length}):</h4><p style="font-size:12px; margin-top: 0;">${faltantes.join(' | ') || 'Ninguno'}</p>${noAplica.length > 0 ? `<h4 style="color:#7f8c8d; margin-bottom: 5px;">🚫 No Aplica (${noAplica.length}):</h4><p style="font-size:12px; margin-top: 0;">${noAplica.join(' | ')}</p>` : ''}</div>`; 
     Swal.fire({ title: `Estadísticas: ${nombre}`, html: htmlContent, icon: 'info', width: '700px', showConfirmButton: false, showCloseButton: true });
 }
 
@@ -494,27 +1220,87 @@ function aplicarInterfazLogueada() {
         let panelAdmin = document.getElementById("panelAdmin"); if (panelAdmin) panelAdmin.style.display = "block";
         document.querySelectorAll('.admin-only').forEach(btn => btn.style.display = 'inline-block');
         let btnLogin = document.getElementById("btnLogin"); if (btnLogin) { btnLogin.innerHTML = `🔓 Cerrar Sesión (${usuarioActual})`; btnLogin.style.backgroundColor = "#c0392b"; }
+        // El panel de usuarios (ABM) solo lo ven los admin fijos, no un usuario con perfil "edición"
+        let btnCfg = document.getElementById("btnConfigUsuarios");
+        if (btnCfg) btnCfg.style.display = puedeAdministrarUsuarios() ? "inline-block" : "none";
     }
 }
 
 async function solicitarAcceso() {
-    if (modoEdicion) {
-        modoEdicion = false; registrarAccion(`Cerró sesión`); usuarioActual = "Sistema"; localStorage.removeItem("entrenadorActivo"); 
+    if (modoEdicion || rolVista) {
+        modoEdicion = false; rolVista = null; filtroSegmento = "TODOS";
+        registrarAccion(`Cerró sesión`); usuarioActual = "Sistema"; localStorage.removeItem("entrenadorActivo"); localStorage.removeItem("emailActivo");
+        try { if (typeof auth !== 'undefined' && auth.currentUser) auth.signOut(); } catch(e) {}
         let panelAdmin = document.getElementById("panelAdmin"); if (panelAdmin) panelAdmin.style.display = "none";
         document.querySelectorAll('.admin-only').forEach(btn => btn.style.display = 'none');
+        let selSeg = document.getElementById("filtroSegmento"); if (selSeg) { selSeg.value = "TODOS"; selSeg.disabled = false; }
         let btnMatriz = document.querySelector('.navegacion-modulos button'); if (btnMatriz) cambiarModulo('vista-matriz', btnMatriz);
         let btnLogin = document.getElementById("btnLogin"); if (btnLogin) { btnLogin.innerHTML = "🔒 Activar Edición"; btnLogin.style.backgroundColor = "#34495e"; }
         crearEncabezado(); crearTabla(); renderizarSesiones(); renderizarActividades(); return;
     }
-    const { value: password } = await Swal.fire({ title: 'Clave de Entrenadores', input: 'password', showCancelButton: true, confirmButtonColor: '#2ecc71' });
-    if (password === CLAVE_SECRETA) {
-        const { value: nombreEntrenador } = await Swal.fire({ title: '¿Quién sos?', input: 'select', inputOptions: { 'Solange Mieres': 'Solange Mieres', 'Julia Bandin': 'Julia Bandin', 'Hernán Caraballo': 'Hernán Caraballo', 'Adriana Klehr': 'Adriana Klehr' }, showCancelButton: true, allowOutsideClick: false, confirmButtonColor: '#3498db' });
-        if (nombreEntrenador) {
-            usuarioActual = nombreEntrenador; modoEdicion = true; localStorage.setItem("entrenadorActivo", usuarioActual); 
-            aplicarInterfazLogueada(); registrarAccion(`Inició sesión en el sistema.`); crearEncabezado(); crearTabla(); renderizarSesiones(); renderizarActividades();
+    const { value: creds } = await Swal.fire({
+        title: 'Acceso de Entrenadores',
+        html: `<input type="email" id="swl-email" class="swal2-input" placeholder="Correo electrónico">
+               <input type="password" id="swl-pass" class="swal2-input" placeholder="Contraseña">`,
+        confirmButtonText: 'Iniciar Sesión',
+        confirmButtonColor: '#2ecc71',
+        showCancelButton: true,
+        allowOutsideClick: false,
+        preConfirm: () => ({
+            email: document.getElementById('swl-email').value,
+            pass: document.getElementById('swl-pass').value
+        })
+    });
+    if (!creds || !creds.email) return;
+    try {
+        const result = await auth.signInWithEmailAndPassword(creds.email, creds.pass);
+        const user = result.user;
+        const nombre = user.displayName || creds.email.split('@')[0];
+        const rol = rolDeEmail(user.email);
+
+        if (rol) {
+            // Usuario de SOLO LECTURA (supervisor o gerente)
+            rolVista = rol;
+            modoEdicion = false;
+            filtroSegmento = SEGMENTO_POR_ROL[rol] || "TODOS";
+            usuarioActual = nombre;
+            localStorage.setItem("entrenadorActivo", usuarioActual);
+            localStorage.setItem("emailActivo", (user.email || "").toLowerCase());
+            aplicarModoSoloLectura();
+            registrarAccion(`Ingresó en solo lectura como ${rol}: ${nombre}`);
+            let queVe = filtroSegmento === "TODOS" ? "todos los segmentos" : `el segmento ${filtroSegmento}s`;
+            Swal.fire({ title: `¡Hola ${nombre}!`, text: `Vista de solo lectura — viendo ${queVe}.`, icon: 'success', timer: 2000, showConfirmButton: false });
+        } else {
+            // Usuario ADMIN / entrenador (edición total, como siempre)
+            usuarioActual = nombre; modoEdicion = true; rolVista = null;
+            localStorage.setItem("entrenadorActivo", usuarioActual);
+            localStorage.setItem("emailActivo", (user.email || "").toLowerCase());
+            aplicarInterfazLogueada(); registrarAccion(`Inició sesión en el sistema.`);
+            crearEncabezado(); crearTabla(); renderizarSesiones(); renderizarActividades();
             Swal.fire({ title: `¡Hola ${usuarioActual}!`, text: 'Módulos de Capacitadores desbloqueados.', icon: 'success', timer: 1500, showConfirmButton: false });
         }
-    } else if (password) { Swal.fire('Error', 'Clave incorrecta', 'error'); }
+    } catch (e) {
+        Swal.fire('Error', 'Usuario o contraseña incorrectos.', 'error');
+    }
+}
+
+/* -------------------- 👁️ VISTAS DE SOLO LECTURA (SUPERVISOR / GERENTE) -------------------- */
+function aplicarModoSoloLectura() {
+    // Ocultar todo lo de admin/edición
+    let panelAdmin = document.getElementById("panelAdmin"); if (panelAdmin) panelAdmin.style.display = "none";
+    document.querySelectorAll('.admin-only').forEach(btn => btn.style.display = 'none');
+    // Selector de segmento: bloqueado para supervisor (segmento fijo); para gerente queda libre (ve todo)
+    let selSeg = document.getElementById("filtroSegmento");
+    if (selSeg) {
+        selSeg.value = filtroSegmento;
+        selSeg.disabled = (rolVista === "supervisor"); // gerente puede navegar entre segmentos
+    }
+    // El botón de login pasa a "Cerrar Sesión" para poder salir
+    let btnLogin = document.getElementById("btnLogin");
+    if (btnLogin) { btnLogin.innerHTML = `🔓 Cerrar Sesión (${usuarioActual})`; btnLogin.style.backgroundColor = "#c0392b"; btnLogin.style.display = "inline-block"; }
+    // Ir a la matriz y refrescar
+    let btnMatriz = document.querySelector('.navegacion-modulos button'); if (btnMatriz) cambiarModulo('vista-matriz', btnMatriz);
+    crearEncabezado(); crearTabla(); actualizarDashboard();
 }
 
 function syncEstadoActividad(idSesion, nuevoEstado) {
@@ -555,7 +1341,237 @@ async function cambiarEstadoRequerimiento(idSesion, nuevoEstado) {
             let revertidos = 0; sesion.convocados.forEach(conv => { let est = conv.estado ? conv.estado.toLowerCase() : ""; if (est === "presente") { conv.estado = "pendiente"; revertidos++; } }); Swal.fire({ toast: true, position: 'top-end', icon: 'warning', title: `Deshacer: Se revirtieron ${revertidos} operadores a Pendiente.`, showConfirmButton: false, timer: 3000 });
         }
         let labelCurso = (sesion.cursos && sesion.cursos.length > 0) ? sesion.cursos.join(' + ') : sesion.curso; registrarAccion(`Cambió estado del req. ${labelCurso} a: ${nuevoEstado}`); guardarDatos(); renderizarSesiones(); renderizarActividades(); crearTabla();
-    } 
+        verificarSeguimientoCompleto();
+    }
+}
+
+/* -------------------- 🎯 SEGUIMIENTO RÁPIDO DE REQUERIMIENTOS EN PARALELO -------------------- */
+// Guarda un comentario libre en el encabezado azul de la tarjeta del requerimiento
+function actualizarComentarioSesion(idSesion, texto) {
+    let sesion = sesiones.find(s => s.id.toString() === idSesion.toString());
+    if (!sesion) return;
+    if ((sesion.comentarios || '') === texto) return; // sin cambios, no gastar una escritura
+    sesion.comentarios = texto;
+    registrarAccion(`Editó comentarios del req. ${(sesion.cursos || [sesion.curso]).join(' + ')}`);
+    guardarDatos();
+}
+
+// Suma o saca un requerimiento de la selección de seguimiento conjunto
+async function toggleSeguimiento(idSesion) {
+    let idStr = idSesion.toString();
+    let i = seguimientoSeleccion.indexOf(idStr);
+    if (i >= 0) seguimientoSeleccion.splice(i, 1); else seguimientoSeleccion.push(idStr);
+    await guardarCampoGAC({ seguimientoSeleccion });
+    renderizarSesiones();
+}
+
+async function vaciarSeguimiento() {
+    seguimientoSeleccion = [];
+    await guardarCampoGAC({ seguimientoSeleccion });
+    renderizarSesiones();
+}
+
+// Arma la barra flotante con el % de avance de los requerimientos elegidos para seguir juntos
+function renderizarBarraSeguimiento() {
+    let cont = document.getElementById('barra-seguimiento');
+    if (!cont) return;
+    if (!seguimientoSeleccion || seguimientoSeleccion.length === 0) { cont.innerHTML = ''; return; }
+
+    let elegidos = sesiones.filter(s => seguimientoSeleccion.includes(s.id.toString()));
+    let total = elegidos.length;
+    let finalizados = elegidos.filter(s => s.estadoReq === 'Finalizado').length;
+    let pct = total > 0 ? Math.round((finalizados / total) * 100) : 0;
+    let nombres = elegidos.map(s => (s.cursos && s.cursos.length > 0) ? s.cursos.join('+') : (s.curso || 'Sin producto'));
+
+    cont.innerHTML = `
+        <div style="background:#eafaf1; border:1px solid #27ae60; border-radius:8px; padding:12px 15px; margin-bottom:20px; display:flex; align-items:center; gap:15px; flex-wrap:wrap;">
+            <div style="flex:1; min-width:220px;">
+                <b style="color:#1e8449;">🎯 Seguimiento conjunto (${total} req.):</b>
+                <span style="font-size:12px; color:#555;"> ${nombres.join(' | ')}</span>
+                <div style="background:#d5f5e3; border-radius:6px; height:14px; margin-top:6px; overflow:hidden;">
+                    <div style="background:#27ae60; height:100%; width:${pct}%; transition: width 0.3s;"></div>
+                </div>
+            </div>
+            <div style="font-weight:bold; color:#1e8449; font-size:16px;">${finalizados}/${total} (${pct}%)</div>
+            <button onclick="vaciarSeguimiento()" style="background:#7f8c8d; color:white; border:none; padding:6px 10px; border-radius:5px; cursor:pointer; font-size:12px;">Vaciar</button>
+        </div>`;
+}
+
+// Si todos los requerimientos elegidos llegaron a "Finalizado", deja un aviso pendiente para Adriana
+async function verificarSeguimientoCompleto() {
+    if (!seguimientoSeleccion || seguimientoSeleccion.length === 0) return;
+    let elegidos = sesiones.filter(s => seguimientoSeleccion.includes(s.id.toString()));
+    if (elegidos.length === 0 || elegidos.length !== seguimientoSeleccion.length) return;
+    let todosFinalizados = elegidos.every(s => s.estadoReq === 'Finalizado');
+    if (!todosFinalizados) return;
+
+    let nombres = elegidos.map(s => (s.cursos && s.cursos.length > 0) ? s.cursos.join('+') : (s.curso || 'Sin producto'));
+    let mensaje = `Se completó el 100% del seguimiento conjunto: ${nombres.join(' | ')}`;
+    registrarAccion(`Seguimiento conjunto llegó al 100% (${nombres.join(' | ')})`);
+    let nuevoAviso = { mensaje, fecha: new Date().toLocaleString('es-AR'), vista: false };
+    await guardarCampoGAC({ notificacionAdriana: nuevoAviso, seguimientoSeleccion: [] }); // se vacía para poder armar el próximo seguimiento
+    seguimientoSeleccion = [];
+    Swal.fire({ icon: 'success', title: '🎉 ¡100% completado!', text: 'Se dejó un aviso para Adriana la próxima vez que entre al sistema.', timer: 3500, showConfirmButton: false });
+}
+
+// Muestra el aviso pendiente (si hay uno sin ver) la próxima vez que alguien entra al sistema
+async function mostrarNotificacionAdrianaSiHay() {
+    if (!notificacionAdriana || notificacionAdriana.vista) return;
+    const { isConfirmed } = await Swal.fire({
+        icon: 'success',
+        title: '📣 Aviso para Adriana',
+        html: `<p>${notificacionAdriana.mensaje}</p><p style="font-size:12px; color:#7f8c8d;">${notificacionAdriana.fecha}</p>`,
+        confirmButtonText: 'Entendido',
+        confirmButtonColor: '#27ae60'
+    });
+    if (isConfirmed) {
+        await guardarCampoGAC({ notificacionAdriana: { ...notificacionAdriana, vista: true } });
+    }
+}
+
+/* -------------------- 🆕 FUNCIONES NUEVAS (Excel líderes / estado masivo / duplicados) -------------------- */
+
+// #1 — Exportar a Excel la lista de convocados de una sesión (para enviar a líderes)
+function exportarConvocadosExcel(idSesion) {
+    let sesion = sesiones.find(s => s.id.toString() === idSesion.toString());
+    if (!sesion) { Swal.fire('Error', 'No encontré la sesión.', 'error'); return; }
+    let productos = (sesion.cursos && sesion.cursos.length > 0) ? sesion.cursos.join(' + ') : (sesion.curso || 'Sin producto');
+    let mapaEstado = {
+        pendiente: 'Pendiente', presente: 'Presente', ausente: 'Ausente',
+        licencia: 'Licencia', capacitado: 'Evaluado'
+    };
+    // Mapa nombre → área (desde los operadores cargados)
+    let areaDe = (nombre) => { let op = operadores.find(o => o.nombre === nombre); return (op && op.area) ? op.area : 'Sin área'; };
+
+    // Encabezado + filas: Operador | Área | Producto | Estado | Fecha de deslogueo | Comentarios
+    let aoa = [['Operador', 'Área', 'Producto', 'Estado', 'Fecha de deslogueo', 'Comentarios']];
+
+    // Agrupar convocados por área (ordenados: CR, MDA, luego el resto)
+    let convocadosConArea = sesion.convocados.map(conv => ({ ...conv, area: areaDe(conv.nombre) }));
+    let ordenAreas = ["CR", "MDA"];
+    let areasPresentes = [...new Set(convocadosConArea.map(c => c.area))]
+        .sort((a, b) => {
+            let ia = ordenAreas.indexOf(a); let ib = ordenAreas.indexOf(b);
+            if (ia === -1 && ib === -1) return a.localeCompare(b);
+            if (ia === -1) return 1; if (ib === -1) return -1;
+            return ia - ib;
+        });
+
+    areasPresentes.forEach(area => {
+        let delArea = convocadosConArea
+            .filter(c => c.area === area)
+            .sort((a, b) => a.nombre.localeCompare(b.nombre));
+        delArea.forEach(conv => {
+            let est = conv.estado ? (mapaEstado[conv.estado.toLowerCase()] || conv.estado) : 'Pendiente';
+            aoa.push([conv.nombre, area, productos, est, '', '']);
+        });
+        // Subtotal por área
+        let evalArea = delArea.filter(c => (c.estado || '').toLowerCase() === 'capacitado').length;
+        aoa.push([`Subtotal ${area}`, `${delArea.length} operador(es)`, '', `${evalArea} evaluado(s)`, '', '']);
+        aoa.push([]); // fila en blanco separadora
+    });
+
+    // Fila de conteo general al pie
+    let total = sesion.convocados.length;
+    let evaluados = sesion.convocados.filter(c => (c.estado || '').toLowerCase() === 'capacitado').length;
+    let pendientes = total - evaluados;
+    aoa.push(['TOTAL GENERAL', total, '', '', '', '']);
+    aoa.push(['Evaluados', evaluados, '', '', '', '']);
+    aoa.push(['Pendientes de evaluar', pendientes, '', '', '', '']);
+
+    let ws = XLSX.utils.aoa_to_sheet(aoa);
+    ws['!cols'] = [{ wch: 32 }, { wch: 12 }, { wch: 30 }, { wch: 16 }, { wch: 18 }, { wch: 40 }];
+    let wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'A evaluar');
+    let nombreArchivo = `Convocados_${productos.replace(/[^a-zA-Z0-9]/g, '_').substring(0, 40)}_${sesion.tipo || ''}.xlsx`;
+    XLSX.writeFile(wb, nombreArchivo);
+    registrarAccion(`Descargó Excel de convocados: ${productos} (${sesion.tipo || ''})`);
+}
+
+// #2 — Poner a TODOS los convocados de una sesión en un mismo estado de asistencia
+async function estadoMasivoConvocados(idSesion) {
+    let sesion = sesiones.find(s => s.id.toString() === idSesion.toString());
+    if (!sesion || !sesion.convocados || sesion.convocados.length === 0) {
+        Swal.fire('Sin convocados', 'Esta sesión no tiene operadores convocados.', 'info'); return;
+    }
+    const { value: nuevoEstado } = await Swal.fire({
+        title: 'Cambiar estado a TODOS',
+        input: 'select',
+        inputOptions: {
+            pendiente: '⏳ Pendiente', presente: '✅ Presente',
+            ausente: '❌ Ausente', licencia: '🏖️ Licencia'
+        },
+        inputPlaceholder: 'Elegí un estado',
+        html: `<p style="font-size:13px;color:#555;">Se aplicará a los <b>${sesion.convocados.length}</b> convocados de esta sesión.</p>`,
+        showCancelButton: true, confirmButtonText: 'Aplicar a todos', cancelButtonText: 'Cancelar',
+        inputValidator: (v) => !v ? 'Elegí un estado' : undefined
+    });
+    if (!nuevoEstado) return;
+    let cambiados = 0;
+    sesion.convocados.forEach(conv => {
+        // No piso a los que ya están evaluados (capacitado), para no borrar notas cargadas
+        if ((conv.estado || '').toLowerCase() === 'capacitado') return;
+        conv.estado = nuevoEstado; cambiados++;
+    });
+    registrarAccion(`Cambió estado masivo de ${cambiados} convocados a "${nuevoEstado}" en ${(sesion.cursos||[sesion.curso]).join(' + ')}`);
+    guardarDatos(); renderizarSesiones();
+    Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: `${cambiados} convocados → ${nuevoEstado}`, showConfirmButton: false, timer: 2500 });
+}
+
+// #3 — Detectar registros duplicados en el historial de un operador.
+// Coincide si: mismo tipo de requerimiento + misma fecha (día) + mismo porcentaje.
+// Devuelve un array de mensajes de advertencia (vacío si no hay duplicados).
+function detectarDuplicados(registrosNuevos) {
+    // registrosNuevos: [{ nombreOp, curso, tipo, fecha, porcentaje }]
+    let avisos = [];
+    const soloDia = (f) => f ? String(f).split(' ')[0].trim() : '';
+    const normPct = (p) => (p === null || p === undefined || p === '' || String(p).toUpperCase() === 'N/A') ? 'N/A' : String(p).replace('%', '').trim();
+
+    registrosNuevos.forEach(reg => {
+        let op = operadores.find(o => o.nombre === reg.nombreOp);
+        if (!op || !op.estados || !op.estados[reg.curso] || !op.estados[reg.curso].historial) return;
+        let existe = op.estados[reg.curso].historial.some(h =>
+            (h.tipo === reg.tipo) &&
+            (soloDia(h.fecha) === soloDia(reg.fecha)) &&
+            (normPct(h.porcentaje) === normPct(reg.porcentaje))
+        );
+        if (existe) {
+            avisos.push(`${reg.nombreOp} — ${reg.curso} (${reg.tipo}, ${soloDia(reg.fecha)}, ${normPct(reg.porcentaje)}${normPct(reg.porcentaje) !== 'N/A' ? '%' : ''})`);
+        }
+    });
+    return avisos;
+}
+
+
+// 🔧 Inserta o actualiza un registro del historial evitando duplicados.
+// Marca cada registro con idSesion. Si ya existe uno de la misma sesión + tipo, lo edita en vez de duplicar.
+// Si el registro no tiene idSesion (carga vieja), usa tipo+fecha+curso como huella para no duplicar.
+function upsertHistorial(op, cursoActual, registro, idSesion) {
+    if (!op.estados) op.estados = {};
+    let info = op.estados[cursoActual] || { estado: "rojo", historial: [] };
+    if (!info.historial) info.historial = [];
+    const soloDia = (f) => f ? String(f).split(' ')[0].trim() : '';
+
+    let idx = -1;
+    if (idSesion) {
+        // 1º criterio: mismo origen de sesión + mismo tipo
+        idx = info.historial.findIndex(h => h.idSesion && h.idSesion.toString() === idSesion.toString() && h.tipo === registro.tipo);
+    }
+    if (idx === -1) {
+        // 2º criterio (registros viejos sin idSesion): misma huella tipo+fecha
+        idx = info.historial.findIndex(h => !h.idSesion && h.tipo === registro.tipo && soloDia(h.fecha) === soloDia(registro.fecha));
+    }
+
+    registro.idSesion = idSesion ? idSesion.toString() : (registro.idSesion || null);
+    if (idx >= 0) {
+        // editar el existente (conserva lo que no venga en el registro nuevo)
+        info.historial[idx] = { ...info.historial[idx], ...registro };
+    } else {
+        info.historial.push(registro);
+    }
+    info.estado = "verde";
+    op.estados[cursoActual] = info;
+    return info;
 }
 
 /* -------------------- 📅 RENDERIZAR SESIONES Y REQUERIMIENTOS -------------------- */
@@ -598,8 +1614,8 @@ function renderizarSesiones() {
         }
 
         let footerHTML = !esArchivada 
-            ? `<div class="card-sesion-footer" style="display:flex; gap:10px; padding:15px; background:white; border-top:1px solid #eee;"><button style="flex:2; background:#2980b9; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer;" ${!modoEdicion ? 'disabled' : ''} onclick="volcarNotasParciales('${sesion.id}')">📝 Evaluar</button><button style="flex:1; background:#7f8c8d; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer;" ${!modoEdicion ? 'disabled' : ''} onclick="archivarSesion('${sesion.id}')">📦 Archivar</button></div>` 
-            : `<div class="card-sesion-footer" style="display:flex; gap:10px; padding:15px; background:#ecf0f1; border-top:1px solid #ddd; align-items:center;"><div style="flex:1; text-align:center; color:#7f8c8d; font-weight:bold; font-size:12px;"><i class="fa-solid fa-box-archive"></i> ARCHIVADO</div><button style="flex:2; background:#2980b9; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer; font-weight:bold;" ${!modoEdicion ? 'disabled' : ''} onclick="desarchivarSesion('${sesion.id}')"><i class="fa-solid fa-rotate-left"></i> Desarchivar</button></div>`;
+            ? `<div class="card-sesion-footer" style="display:flex; flex-direction:column; gap:8px; padding:15px; background:white; border-top:1px solid #eee;"><div style="display:flex; gap:8px;"><button style="flex:1; background:#27ae60; color:white; border:none; padding:9px; border-radius:5px; cursor:pointer; font-size:13px;" onclick="exportarConvocadosExcel('${sesion.id}')" title="Descargar Excel de convocados para líderes"><i class="fa-solid fa-file-excel"></i> Excel</button><button style="flex:1; background:#16a085; color:white; border:none; padding:9px; border-radius:5px; cursor:${modoEdicion ? 'pointer' : 'not-allowed'}; font-size:13px; opacity:${modoEdicion ? '1' : '0.6'};" ${!modoEdicion ? 'disabled' : ''} onclick="estadoMasivoConvocados('${sesion.id}')" title="Poner el mismo estado a todos los convocados"><i class="fa-solid fa-layer-group"></i> Estado a todos</button></div><div style="display:flex; gap:10px;"><button style="flex:2; background:#2980b9; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer;" ${!modoEdicion ? 'disabled' : ''} onclick="volcarNotasParciales('${sesion.id}')">📝 Evaluar</button><button style="flex:1; background:#7f8c8d; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer;" ${!modoEdicion ? 'disabled' : ''} onclick="archivarSesion('${sesion.id}')">📦 Archivar</button></div></div>` 
+            : `<div class="card-sesion-footer" style="display:flex; gap:10px; padding:15px; background:#ecf0f1; border-top:1px solid #ddd; align-items:center;"><button style="flex:1; background:#27ae60; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer; font-weight:bold;" onclick="exportarConvocadosExcel('${sesion.id}')" title="Descargar Excel de convocados para líderes"><i class="fa-solid fa-file-excel"></i> Excel</button><button style="flex:2; background:#2980b9; color:white; border:none; padding:10px; border-radius:5px; cursor:pointer; font-weight:bold;" ${!modoEdicion ? 'disabled' : ''} onclick="desarchivarSesion('${sesion.id}')"><i class="fa-solid fa-rotate-left"></i> Desarchivar</button></div>`;
         
         let tituloTarjeta = (sesion.cursos && sesion.cursos.length > 0) ? sesion.cursos.join(' + ').toUpperCase() : (sesion.curso ? sesion.curso.toUpperCase() : 'SIN PRODUCTO');
 
@@ -609,6 +1625,7 @@ function renderizarSesiones() {
                     <span class="badge-tipo">${sesion.tipo}</span> ${badgeVinculo} ${btnEditar}${btnEliminar}
                     <h3>${tituloTarjeta}</h3>
                     <p class="entrenador">${sesion.entrenador}</p>
+                    <textarea placeholder="Agregar comentario..." onchange="actualizarComentarioSesion('${sesion.id}', this.value)" ${!modoEdicion ? 'disabled' : ''} style="width:100%; margin-top:8px; padding:6px 8px; border-radius:4px; border:none; background:rgba(255,255,255,0.18); color:white; font-size:12px; resize:vertical; min-height:32px; box-sizing:border-box;">${escapeHtml(sesion.comentarios)}</textarea>
                 </div>
                 <div class="card-sesion-body">
                     <div class="info-fechas">
@@ -623,6 +1640,7 @@ function renderizarSesiones() {
                             <option value="Finalizado" ${estadoReq === 'Finalizado' ? 'selected' : ''}>✅ Finalizado</option>
                         </select>
                     </div>
+                    ${!esArchivada ? `<label style="display:flex; align-items:center; gap:6px; margin-top:8px; font-size:12px; cursor:pointer;"><input type="checkbox" onchange="toggleSeguimiento('${sesion.id}')" ${seguimientoSeleccion.includes(sesion.id.toString()) ? 'checked' : ''} ${!modoEdicion ? 'disabled' : ''}> 🎯 Sumar a seguimiento conjunto</label>` : ''}
                     ${btnNotas}
                     ${btnVincularCR}
                     ${enlacesHTML}
@@ -642,6 +1660,7 @@ function renderizarSesiones() {
     });
 
     contenedorActivas.innerHTML = htmlActivas;
+    renderizarBarraSeguimiento();
 
     if (contenedorArchivadas) {
         if (cantArchivadas > 0) {
@@ -662,6 +1681,77 @@ function renderizarSesiones() {
     }
 }
 
+
+/* -------------------- 📓 BITÁCORA DIARIA DE PLANIFICACIÓN -------------------- */
+async function abrirBitacoraDiaria() {
+    if (!modoEdicion) return;
+    // Fecha de hoy en formato YYYY-MM-DD
+    let hoy = new Date().toISOString().split('T')[0];
+
+    // Armar el historial de días (más reciente primero)
+    let dias = Object.keys(bitacoraPlanificacion).sort().reverse();
+    let htmlDias = dias.map(dia => {
+        let fechaVisual = dia.split('-').reverse().join('/');
+        let comentarios = (bitacoraPlanificacion[dia] || []).map((c, i) => `
+            <div style="background:white; border-left:4px solid #f39c12; padding:8px 10px; margin-bottom:8px; text-align:left; border-radius:4px; position:relative;">
+                <strong style="color:#2c3e50; font-size:13px;">🧑‍🏫 ${c.autor}</strong>
+                <span style="color:#7f8c8d; font-size:11px; float:right;">${c.hora || ''}</span>
+                <button onclick="Swal.close(); setTimeout(()=>eliminarComentarioDiario('${dia}', ${i}),300)" style="background:none;border:none;color:#e74c3c;cursor:pointer;float:right;margin-right:8px;font-size:12px;" title="Eliminar">🗑️</button>
+                <p style="margin:6px 0 0 0; color:#444; font-size:13px;">${c.texto}</p>
+            </div>`).join('');
+        return `<div style="margin-bottom:15px;">
+            <div style="font-weight:bold; color:#1f497d; font-size:14px; border-bottom:2px solid #eee; padding-bottom:4px; margin-bottom:8px;">📅 ${fechaVisual}</div>
+            ${comentarios || '<p style="color:#999; font-size:12px;">Sin comentarios.</p>'}
+        </div>`;
+    }).join('');
+    if (!htmlDias) htmlDias = '<p style="color:#999; text-align:center;">Todavía no hay comentarios en la bitácora.</p>';
+
+    // Autores
+    let autores = ["Solange Mieres", "Hernán Caraballo", "Julia Bandin"];
+    let opcAutores = autores.map(a => `<option value="${a}">${a}</option>`).join('');
+
+    await Swal.fire({
+        title: '📓 Bitácora Diaria de Planificación',
+        width: '650px',
+        html: `
+            <div style="background:#f8f9fa; padding:12px; border-radius:6px; border:1px dashed #ccc; margin-bottom:15px; text-align:left;">
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">Fecha:</label>
+                <input type="date" id="bd-fecha" class="swal2-input" style="margin:5px 0; width:100%;" value="${hoy}">
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">¿Quién comenta?</label>
+                <select id="bd-autor" class="swal2-select" style="width:100%; margin:5px 0; padding:6px;">${opcAutores}</select>
+                <label style="font-size:12px; font-weight:bold; color:#34495e;">Comentario del día:</label>
+                <textarea id="bd-texto" class="swal2-textarea" style="width:100%; margin:5px 0 0 0; height:70px;" placeholder="Ej: Hoy se coordinó con Sistemas la carga de..."></textarea>
+                <button onclick="guardarComentarioDiario()" style="margin-top:8px; background:#27ae60; color:white; border:none; padding:8px 16px; border-radius:5px; font-weight:bold; cursor:pointer;">💾 Agregar comentario</button>
+            </div>
+            <div style="max-height:300px; overflow-y:auto; text-align:left; background:#ecf0f1; padding:12px; border-radius:6px;">${htmlDias}</div>`,
+        showConfirmButton: true, confirmButtonText: 'Cerrar', confirmButtonColor: '#7f8c8d'
+    });
+}
+
+async function guardarComentarioDiario() {
+    let fecha = document.getElementById('bd-fecha').value;
+    let autor = document.getElementById('bd-autor').value;
+    let texto = document.getElementById('bd-texto').value.trim();
+    if (!fecha || !texto) { Swal.showValidationMessage('Completá la fecha y el comentario'); return; }
+    if (!bitacoraPlanificacion[fecha]) bitacoraPlanificacion[fecha] = [];
+    let hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
+    bitacoraPlanificacion[fecha].push({ autor, texto, hora });
+    registrarAccion(`Agregó comentario en bitácora diaria (${fecha})`);
+    await guardarCampoGAC({ bitacoraPlanificacion });
+    abrirBitacoraDiaria(); // refrescar (se vuelve a abrir siempre, haya guardado bien o no)
+}
+
+async function eliminarComentarioDiario(dia, index) {
+    const { isConfirmed } = await Swal.fire({ title: '¿Eliminar comentario?', icon: 'warning', showCancelButton: true, confirmButtonColor: '#e74c3c', confirmButtonText: 'Eliminar' });
+    if (!isConfirmed) { abrirBitacoraDiaria(); return; }
+    if (bitacoraPlanificacion[dia]) {
+        bitacoraPlanificacion[dia].splice(index, 1);
+        if (bitacoraPlanificacion[dia].length === 0) delete bitacoraPlanificacion[dia];
+        registrarAccion(`Eliminó comentario de bitácora diaria (${dia})`);
+        await guardarCampoGAC({ bitacoraPlanificacion });
+    }
+    abrirBitacoraDiaria();
+}
 
 /* -------------------- 📔 BITÁCORA DE ENTRENADORES (NOMBRES Y EDICIÓN) -------------------- */
 async function abrirBitacora(idSesion) {
@@ -702,11 +1792,11 @@ async function volcarNotasParciales(idSesion) {
     
     let htmlNotas = presentes.map(nombre => { 
         let idLimpio = nombre.replace(/\s+/g, ''); 
-        return `<div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; text-align: left; border: 1px solid #dee2e6;"><label style="font-weight:bold; font-size:14px; color:#2980b9;">${nombre}</label><div style="display: flex; gap: 10px; align-items: center; margin-top:5px;"><div style="flex: 1.5;" title="Fecha de Carga"><input type="date" id="fecha-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${fechaHoy}"></div><div style="flex: 1;"><input type="time" id="hora-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${horaAhora}"></div><div style="flex: 1.2; display: flex; align-items: center; gap: 8px;"><input type="number" id="nota-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" min="0" max="100" placeholder="Nota %"><label style="font-size: 11px; font-weight:bold; color:#7f8c8d; cursor:pointer; display:flex; align-items:center; gap:3px;" title="Sin evaluación usa la Fecha de Fin del curso"><input type="checkbox" id="na-${idLimpio}" onchange="let n = document.getElementById('nota-${idLimpio}'); let f = document.getElementById('fecha-${idLimpio}'); n.disabled = this.checked; if(this.checked){ n.value = ''; f.disabled = true; f.value = '${fechaFinSesion}'; } else { f.disabled = false; f.value = '${fechaHoy}'; }"> N/A</label></div></div><textarea id="obs-${idLimpio}" class="swal2-textarea" style="width:100%; margin: 5px 0 0 0; padding:8px; font-size: 13px; border: 1px dashed #bdc3c7; resize:vertical; box-sizing:border-box;" rows="3" placeholder="Observaciones / Temas a reforzar (Usá ENTER para bajar de línea)"></textarea></div>` 
+        return `<div style="background: #f8f9fa; padding: 10px; border-radius: 5px; margin-bottom: 10px; text-align: left; border: 1px solid #dee2e6;"><label style="font-weight:bold; font-size:14px; color:#2980b9;">${nombre}</label><div style="display: flex; gap: 10px; align-items: center; margin-top:5px;"><div style="flex: 1.5;" title="Fecha de Carga"><input type="date" id="fecha-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${fechaHoy}"></div><div style="flex: 1;"><input type="time" id="hora-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" value="${horaAhora}"></div><div style="flex: 1.2; display: flex; align-items: center; gap: 8px;"><input type="number" id="nota-${idLimpio}" class="swal2-input" style="width:100%; margin:0; height:32px;" min="0" max="100" placeholder="Nota %"><label style="font-size: 11px; font-weight:bold; color:#7f8c8d; cursor:pointer; display:flex; align-items:center; gap:3px;" title="Sin evaluación usa la Fecha de Fin del curso"><input type="checkbox" id="na-${idLimpio}" onchange="let n = document.getElementById('nota-${idLimpio}'); n.disabled = this.checked; if(this.checked){ n.value = ''; }"> N/A</label></div></div><textarea id="obs-${idLimpio}" class="swal2-textarea" style="width:100%; margin: 5px 0 0 0; padding:8px; font-size: 13px; border: 1px dashed #bdc3c7; resize:vertical; box-sizing:border-box;" rows="3" placeholder="Observaciones / Temas a reforzar (Usá ENTER para bajar de línea)"></textarea></div>` 
     }).join('');
         
     const { value: datosGuardados } = await Swal.fire({ 
-        title: 'Evaluar y Cargar a Matriz', html: `<div style="max-height:350px; overflow-y:auto; overflow-x:hidden; padding-right: 5px;">${htmlNotas}</div>`, width: '600px', showCancelButton: true, confirmButtonText: 'Guardar Notas', 
+        title: 'Evaluar y Cargar a Matriz', html: `<div style="max-height:350px; overflow-y:auto; overflow-x:hidden; padding-right: 5px;">${htmlNotas}</div>`, width: '600px', showCancelButton: true, confirmButtonText: 'Guardar Notas', allowOutsideClick: false, 
         preConfirm: () => { 
             let resultados = {}; 
             for (let nombre of presentes) { 
@@ -722,7 +1812,7 @@ async function volcarNotasParciales(idSesion) {
         let cursosAImpactar = (sesion.cursos && sesion.cursos.length > 0) ? sesion.cursos : [sesion.curso];
         presentes.forEach(nombre => {
             let datos = datosGuardados[nombre]; let op = operadores.find(o => o.nombre === nombre);
-            if (op) { cursosAImpactar.forEach(cursoActual => { let info = op.estados[cursoActual] || { estado: "rojo", historial: [] }; let codigoReal = Object.keys(mapaCodigos).find(key => mapaCodigos[key] === cursoActual && key.startsWith(sesion.tipo)) || ""; let fh = datos.fecha; if (datos.hora) fh += ` ${datos.hora} hs`; info.historial.push({ tipo: sesion.tipo, codigo: codigoReal, fecha: fh, porcentaje: datos.nota, observacion: datos.obs, linkVerificacion: sesion.linkVerificacion || "" }); info.estado = "verde"; op.estados[cursoActual] = info; }); }
+            if (op) { cursosAImpactar.forEach(cursoActual => { let codigoReal = Object.keys(mapaCodigos).find(key => mapaCodigos[key] === cursoActual && key.startsWith(sesion.tipo)) || ""; let fh = datos.fecha; if (datos.hora) fh += ` ${datos.hora} hs`; upsertHistorial(op, cursoActual, { tipo: sesion.tipo, codigo: codigoReal, fecha: fh, porcentaje: datos.nota, observacion: datos.obs, linkVerificacion: sesion.linkVerificacion || "" }, sesion.id); }); }
             let conv = sesion.convocados.find(c => c.nombre === nombre); if(conv) conv.estado = "capacitado";
         });
         if(sesion.estadoReq === "Pendiente") { sesion.estadoReq = "En curso"; syncEstadoActividad(sesion.id.toString(), "En curso"); }
@@ -744,8 +1834,8 @@ async function archivarSesion(idSesion) {
         const { isConfirmed } = await Swal.fire({ title: '¡Falta Evaluación!', html: `Tenés a <b>${presentesSinEvaluar.length}</b> operador/es como "Presente" que no enviaste a la Matriz.<br><br>¿Querés mandarlos automáticamente (sin nota) y archivar la sesión?`, icon: 'warning', showCancelButton: true, confirmButtonColor: '#2980b9', confirmButtonText: 'Sí, enviar a Matriz y archivar', cancelButtonText: 'Cancelar' });
         if (isConfirmed) {
             let fechaParaGuardar = sesion.fechaFin || sesion.fechaInicio || new Date().toISOString().split('T')[0];
-            presentesSinEvaluar.forEach(conv => { let op = operadores.find(o => o.nombre === conv.nombre); if (op) { cursosAImpactar.forEach(cursoActual => { let info = op.estados[cursoActual] || { estado: "rojo", historial: [] }; let codigoReal = Object.keys(mapaCodigos).find(key => mapaCodigos[key] === cursoActual && key.startsWith(sesion.tipo)) || ""; info.historial.push({ tipo: sesion.tipo, codigo: codigoReal, fecha: fechaParaGuardar, porcentaje: "N/A" }); info.estado = "verde"; op.estados[cursoActual] = info; }); } conv.estado = "capacitado"; });
-            sesion.activa = false; sesion.estadoReq = "Finalizado"; syncEstadoActividad(sesion.id.toString(), "Finalizado"); registrarAccion(`Autoevaluó y archivó sesión de: ${cursosAImpactar.join(' + ')}`); guardarDatos(); crearTabla(); renderizarSesiones(); renderizarActividades(); Swal.fire('¡Solucionado!', 'Sesión archivada y Matriz actualizada.', 'success');
+            presentesSinEvaluar.forEach(conv => { let op = operadores.find(o => o.nombre === conv.nombre); if (op) { cursosAImpactar.forEach(cursoActual => { let codigoReal = Object.keys(mapaCodigos).find(key => mapaCodigos[key] === cursoActual && key.startsWith(sesion.tipo)) || ""; upsertHistorial(op, cursoActual, { tipo: sesion.tipo, codigo: codigoReal, fecha: fechaParaGuardar, porcentaje: "N/A" }, sesion.id); }); } conv.estado = "capacitado"; });
+            sesion.activa = false; sesion.estadoReq = "Finalizado"; syncEstadoActividad(sesion.id.toString(), "Finalizado"); registrarAccion(`Autoevaluó y archivó sesión de: ${cursosAImpactar.join(' + ')}`); guardarDatos(); crearTabla(); renderizarSesiones(); renderizarActividades(); verificarSeguimientoCompleto(); Swal.fire('¡Solucionado!', 'Sesión archivada y Matriz actualizada.', 'success');
         }
     } else { 
         const { isConfirmed } = await Swal.fire({ title: '¿Archivar Sesión?', text: "La tarjeta pasará al historial de archivadas en la parte inferior.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#7f8c8d', cancelButtonColor: '#d33', confirmButtonText: 'Sí, archivar', cancelButtonText: 'Cancelar' }); 
@@ -997,13 +2087,13 @@ async function editarSesion(id) {
 
     const { value: formValues } = await Swal.fire({
         title: 'Editar Requerimiento',
-        html: `<div style="display:flex; gap:15px; margin-bottom: 15px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Tipo:</label><select id="swal-tipo-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="CE" ${sesion.tipo === 'CE' ? 'selected' : ''}>CE</option><option value="CR" ${sesion.tipo === 'CR' ? 'selected' : ''}>CR</option><option value="EI" ${sesion.tipo === 'EI' ? 'selected' : ''}>EI</option><option value="VA" ${sesion.tipo === 'VA' ? 'selected' : ''}>VA</option><option value="VRS" ${sesion.tipo === 'VRS' ? 'selected' : ''}>VRS</option></select></div><div style="flex:2; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Entrenador/a:</label><select id="swal-entrenador-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="Solange Mieres" ${sesion.entrenador === 'Solange Mieres' ? 'selected' : ''}>Solange Mieres</option><option value="Hernán Caraballo" ${sesion.entrenador === 'Hernán Caraballo' ? 'selected' : ''}>Hernán Caraballo</option><option value="Julia Bandin" ${sesion.entrenador === 'Julia Bandin' ? 'selected' : ''}>Julia Bandin</option><option value="Julia Bandin / Hernán Caraballo" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo</option><option value="Julia Bandin / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Solange Mieres</option><option value="Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Hernán Caraballo / Solange Mieres</option><option value="Julia Bandin / Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo / Solange Mieres</option></select></div></div><label style="font-size:12px; font-weight:bold; display:block; text-align:left; margin-bottom:3px;">Producto/s:</label><div style="max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff; margin-bottom: 15px; display: block;">${checkboxesProductos}</div><div style="display:flex; gap:10px; margin-bottom: 10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Inicio:</label><input type="date" id="swal-fecha-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Fin:</label><input type="date" id="swal-fecha-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaFin || ''}"></div></div><div style="display:flex; gap:10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Inicio:</label><input type="time" id="swal-hora-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Fin:</label><input type="time" id="swal-hora-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaFin || ''}"></div></div><label style="font-size:12px; font-weight:bold; margin-top:10px; display:block; text-align:left;">Convocados:</label><div style="max-height: 120px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff;">${opsHtml}</div>`,
+        html: `<div style="display:flex; gap:15px; margin-bottom: 15px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Tipo:</label><select id="swal-tipo-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="CE" ${sesion.tipo === 'CE' ? 'selected' : ''}>CE</option><option value="CR" ${sesion.tipo === 'CR' ? 'selected' : ''}>CR</option><option value="EI" ${sesion.tipo === 'EI' ? 'selected' : ''}>EI</option><option value="VA" ${sesion.tipo === 'VA' ? 'selected' : ''}>VA</option><option value="VRS" ${sesion.tipo === 'VRS' ? 'selected' : ''}>VRS</option></select></div><div style="flex:2; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Entrenador/a:</label><select id="swal-entrenador-edit" class="swal2-select" style="margin:0; width:100%; box-sizing:border-box; padding:0 10px; height: 3em;"><option value="Solange Mieres" ${sesion.entrenador === 'Solange Mieres' ? 'selected' : ''}>Solange Mieres</option><option value="Hernán Caraballo" ${sesion.entrenador === 'Hernán Caraballo' ? 'selected' : ''}>Hernán Caraballo</option><option value="Julia Bandin" ${sesion.entrenador === 'Julia Bandin' ? 'selected' : ''}>Julia Bandin</option><option value="Julia Bandin / Hernán Caraballo" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo</option><option value="Julia Bandin / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Solange Mieres</option><option value="Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Hernán Caraballo / Solange Mieres</option><option value="Julia Bandin / Hernán Caraballo / Solange Mieres" ${sesion.entrenador === 'Julia Bandin / Hernán Caraballo / Solange Mieres' ? 'selected' : ''}>Julia Bandin / Hernán Caraballo / Solange Mieres</option></select></div></div><label style="font-size:12px; font-weight:bold; display:block; text-align:left; margin-bottom:3px;">Producto/s:</label><div style="max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff; margin-bottom: 15px; display: block;">${checkboxesProductos}</div><div style="display:flex; gap:10px; margin-bottom: 10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Inicio:</label><input type="date" id="swal-fecha-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Fin:</label><input type="date" id="swal-fecha-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.fechaFin || ''}"></div></div><div style="display:flex; gap:10px;"><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Inicio:</label><input type="time" id="swal-hora-inicio-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaInicio || ''}"></div><div style="flex:1; display:flex; flex-direction:column; text-align:left;"><label style="font-size:12px; font-weight:bold; margin-bottom: 3px;">Hora Fin:</label><input type="time" id="swal-hora-fin-edit" class="swal2-input" style="margin:0; width:100%; box-sizing:border-box;" value="${sesion.horaFin || ''}"></div></div><hr style="margin: 15px 0;"><label style="font-size:12px; font-weight:bold; display:block; text-align:left;"><i class="fa-solid fa-link"></i> Enlaces Útiles (Opcionales):</label><input id="swal-link-verif-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="🔗 Link de Verificación" value="${(sesion.linkVerificacion || '').replace(/"/g, '&quot;')}"><input id="swal-link-kahoot-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="🎮 Link de Kahoot" value="${(sesion.linkKahoot || '').replace(/"/g, '&quot;')}"><input id="swal-link-encuesta-edit" class="swal2-input" style="margin-top:5px; height: 35px; font-size:13px; width:100%; box-sizing:border-box;" placeholder="⭐ Link de Encuesta Satisfacción" value="${(sesion.linkEncuesta || '').replace(/"/g, '&quot;')}"><label style="font-size:12px; font-weight:bold; margin-top:10px; display:block; text-align:left;">Convocados:</label><div style="max-height: 120px; overflow-y: auto; border: 1px solid #ccc; padding: 10px; border-radius: 5px; background: #fff;">${opsHtml}</div>`,
         width: '650px', showCancelButton: true, confirmButtonText: 'Guardar Cambios',
         preConfirm: () => {
             let cursosSeleccionados = Array.from(document.querySelectorAll('.chk-producto-multi-edit:checked')).map(cb => cb.value);
             let convocadosNuevos = Array.from(document.querySelectorAll('.chk-convocado-edit:checked')).map(cb => { let yaEstaba = sesion.convocados.find(c => c.nombre === cb.value); return yaEstaba ? yaEstaba : { nombre: cb.value, estado: "pendiente" }; });
             if (cursosSeleccionados.length === 0 || convocadosNuevos.length === 0) { Swal.showValidationMessage('Elegí al menos un producto y un convocado.'); return false; }
-            sesion.tipo = document.getElementById('swal-tipo-edit').value; sesion.entrenador = document.getElementById('swal-entrenador-edit').value; sesion.cursos = cursosSeleccionados; delete sesion.curso; sesion.fechaInicio = document.getElementById('swal-fecha-inicio-edit').value; sesion.fechaFin = document.getElementById('swal-fecha-fin-edit').value; sesion.horaInicio = document.getElementById('swal-hora-inicio-edit').value; sesion.horaFin = document.getElementById('swal-hora-fin-edit').value; sesion.convocados = convocadosNuevos; return true;
+            sesion.tipo = document.getElementById('swal-tipo-edit').value; sesion.entrenador = document.getElementById('swal-entrenador-edit').value; sesion.cursos = cursosSeleccionados; delete sesion.curso; sesion.fechaInicio = document.getElementById('swal-fecha-inicio-edit').value; sesion.fechaFin = document.getElementById('swal-fecha-fin-edit').value; sesion.horaInicio = document.getElementById('swal-hora-inicio-edit').value; sesion.horaFin = document.getElementById('swal-hora-fin-edit').value; sesion.linkVerificacion = document.getElementById('swal-link-verif-edit').value; sesion.linkKahoot = document.getElementById('swal-link-kahoot-edit').value; sesion.linkEncuesta = document.getElementById('swal-link-encuesta-edit').value; sesion.convocados = convocadosNuevos; return true;
         }
     });
 
@@ -1014,14 +2104,14 @@ async function editarSesion(id) {
     }
 }
 
-async function eliminarSesion(id) { const { isConfirmed } = await Swal.fire({ title: '¿Eliminar Sesión?', text: "Esta acción borrará la sesión de la agenda para siempre.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#e74c3c' }); if (isConfirmed) { actividades = actividades.filter(a => a.idSesionVinculada !== id.toString() && a.id !== 'ACT-' + id.toString()); sesiones = sesiones.filter(s => s.id.toString() !== id.toString()); registrarAccion(`Eliminó un requerimiento de capacitación de la agenda`); guardarDatos(); renderizarSesiones(); renderizarActividades(); } }
+async function eliminarSesion(id) { const { isConfirmed } = await Swal.fire({ title: '¿Eliminar Sesión?', text: "Esta acción borrará la sesión de la agenda para siempre.", icon: 'warning', showCancelButton: true, confirmButtonColor: '#e74c3c' }); if (isConfirmed) { actividades = actividades.filter(a => a.idSesionVinculada !== id.toString() && a.id !== 'ACT-' + id.toString()); sesiones = sesiones.filter(s => s.id.toString() !== id.toString()); registrarAccion(`Eliminó un requerimiento de capacitación de la agenda`); await guardarDatos(); renderizarSesiones(); renderizarActividades(); } }
 
 function descargarMatrizExcel() {
     let fechaHoy = new Date().toLocaleDateString(); let horaHoy = new Date().toLocaleTimeString().substring(0, 5); let opsActivos = operadores.filter(op => mostrarBajas ? op.activo === false : op.activo !== false);
     if (opsActivos.length === 0) { Swal.fire('Atención', 'No hay datos para exportar.', 'warning'); return; }
-    let tablaHTML = `<table border="1" style="width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; font-size: 10px; text-align: center;"><thead><tr style="background-color: #2c3e50; color: white; font-weight: bold;"><th style="padding: 5px;">Operador</th><th style="padding: 5px;">Área</th>${cursos.map(c => `<th style="padding: 5px; font-size: 8px; width: 60px;">${c}</th>`).join('')}</tr></thead><tbody>`;
+    let tablaHTML = `<table border="1" style="width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; font-size: 10px; text-align: center;"><thead><tr style="background-color: #2c3e50; color: white; font-weight: bold;"><th style="padding: 5px;">Operador</th><th style="padding: 5px;">Segmento</th><th style="padding: 5px;">Área</th>${cursos.map(c => `<th style="padding: 5px; font-size: 8px; width: 60px;">${c}</th>`).join('')}</tr></thead><tbody>`;
     opsActivos.forEach(op => {
-        tablaHTML += `<tr><td style="font-weight: bold; padding: 5px; text-align: left;">${op.nombre}</td><td style="padding: 5px;">${op.area || '---'}</td>`;
+        tablaHTML += `<tr><td style="font-weight: bold; padding: 5px; text-align: left;">${op.nombre}</td><td style="padding: 5px;">${segmentoDe(op)}</td><td style="padding: 5px;">${op.area || '---'}</td>`;
         cursos.forEach(curso => {
             let info = op.estados && op.estados[curso] ? op.estados[curso] : { historial: [] }; let celdaTexto = "---"; let colorFondo = "#ffffff";
             if (info.historial && info.historial.length > 0) {
@@ -1041,9 +2131,43 @@ function descargarMatrizExcel() {
 async function emitirActaRefuerzo(nombre) {
     let op = operadores.find(o => o.nombre === nombre); if(!op) return; let cursosDisponibles = {}; cursos.forEach(c => { if(op.estados && op.estados[c] && op.estados[c].historial && op.estados[c].historial.length > 0) { cursosDisponibles[c] = c; } });
     if(Object.keys(cursosDisponibles).length === 0) { Swal.fire('Sin datos', 'Este operador no tiene capacitaciones finalizadas.', 'info'); return; }
-    const { value: cursoSelec } = await Swal.fire({ title: 'Emitir Informe', text: '¿De qué producto querés generar el Informe?', input: 'select', inputOptions: cursosDisponibles, showCancelButton: true }); if(!cursoSelec) return; let hist = op.estados[cursoSelec].historial; let ultimoEvento = hist[hist.length - 1]; let tituloInput = modoEdicion ? 'Capacitador/a' : 'Tu Nombre (Solicitante)'; let valorInput = modoEdicion && usuarioActual !== 'Sistema' ? usuarioActual : ''; const { value: nombreIngresado } = await Swal.fire({ title: tituloInput, input: 'text', inputValue: valorInput, showCancelButton: true, inputValidator: (value) => { if (!value) return 'Por favor, completá este campo para continuar.'; } }); if(!nombreIngresado) return;
+    const { value: cursoSelec } = await Swal.fire({ title: 'Emitir Informe', text: '¿De qué producto querés generar el Informe?', input: 'select', inputOptions: cursosDisponibles, showCancelButton: true }); if(!cursoSelec) return;
+    let hist = op.estados[cursoSelec].historial;
+    // Detectar tipos disponibles para este producto
+    const tiposEnHistorial = {};
+    hist.forEach(e => { if(e.tipo) tiposEnHistorial[e.tipo] = e.tipo; });
+    let tipoSelec = null;
+    if (Object.keys(tiposEnHistorial).length > 1) {
+        const { value: ts } = await Swal.fire({ title: 'Tipo de requerimiento', text: `Hay más de un tipo registrado para ${cursoSelec}. ¿Cuál querés informar?`, input: 'select', inputOptions: tiposEnHistorial, showCancelButton: true, allowOutsideClick: false });
+        if (!ts) return;
+        tipoSelec = ts;
+    } else {
+        tipoSelec = Object.keys(tiposEnHistorial)[0] || null;
+    }
+    // Si hay más de un registro del tipo seleccionado, preguntar cuál descargar
+    const registrosDelTipo = tipoSelec ? hist.filter(e => e.tipo === tipoSelec) : hist;
+    let ultimoEvento;
+    if (registrosDelTipo.length > 1) {
+        const opcionesRegistros = {};
+        registrosDelTipo.forEach((e, i) => {
+            const label = `${e.fecha || 'Sin fecha'} — ${e.porcentaje !== undefined && e.porcentaje !== null ? e.porcentaje + '%' : 'N/A'} — ${e.codigo || ''}`;
+            opcionesRegistros[i] = label;
+        });
+        const { value: idxSelec } = await Swal.fire({
+            title: `Hay ${registrosDelTipo.length} registros de ${tipoSelec}`,
+            text: '¿Cuál querés descargar?',
+            input: 'select',
+            inputOptions: opcionesRegistros,
+            showCancelButton: true,
+            allowOutsideClick: false
+        });
+        if (idxSelec === undefined || idxSelec === null || idxSelec === '') return;
+        ultimoEvento = registrosDelTipo[parseInt(idxSelec)];
+    } else {
+        ultimoEvento = registrosDelTipo[registrosDelTipo.length - 1] || hist[hist.length - 1];
+    } let tituloInput = modoEdicion ? 'Capacitador/a' : 'Tu Nombre (Solicitante)'; let valorInput = modoEdicion && usuarioActual !== 'Sistema' ? usuarioActual : ''; const { value: nombreIngresado } = await Swal.fire({ title: tituloInput, input: 'text', inputValue: valorInput, showCancelButton: true, inputValidator: (value) => { if (!value) return 'Por favor, completá este campo para continuar.'; } }); if(!nombreIngresado) return;
     let obs = ultimoEvento.observacion || "No se registraron respuestas incorrectas."; let obsExcel = obs.replace(/\n/g, "<br style='mso-data-placement:same-cell;' />"); let linkVerifHTML = ultimoEvento.linkVerificacion ? `<br><br><b>Link de Verificación / Examen:</b> <a href="${ultimoEvento.linkVerificacion}" style="color: #2980b9; text-decoration: underline;">${ultimoEvento.linkVerificacion}</a>` : ""; let fechaVisual = ultimoEvento.fecha ? ultimoEvento.fecha.split(' ')[0].split('-').reverse().join('/') : ''; let etiquetaRol = modoEdicion ? 'Capacitador/a:' : 'Solicitante:'; let notaObtenida = (ultimoEvento.porcentaje !== undefined && ultimoEvento.porcentaje !== "" && ultimoEvento.porcentaje !== "N/A") ? ultimoEvento.porcentaje + '%' : 'N/A (Asistencia)';
-    let tablaActaHTML = `<table border="0" style="width: 100%; border-collapse: collapse;"><tr><td colspan="4" style="text-align: center; font-size: 14px; font-weight: bold; background-color: #c0392b; color: white; padding: 5px; border: 1px solid #000;">DOCUMENTO DE EXPORTACIÓN - LOS DATOS OFICIALES RESIDEN EXCLUSIVAMENTE EN EL SISTEMA GIC</td></tr><tr><td colspan="4" style="height: 15px;">&nbsp;</td></tr><tr><td colspan="4" style="text-align: center; font-size: 16px; font-weight: bold; background-color: #1f497d; color: white; padding: 10px; border: 1px solid #000;">INFORME DE CAPACITACIÓN</td></tr><tr><td colspan="4" style="height: 25px;">&nbsp;</td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2; width: 25%;">Fecha:</td><td style="border: 1px solid #000; padding: 5px; text-align: center; width: 25%;">${fechaVisual}</td><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2; width: 25%;">${etiquetaRol}</td><td style="border: 1px solid #000; padding: 5px; text-align: center; width: 25%;">${nombreIngresado}</td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Operador:</td><td style="border: 1px solid #000; padding: 5px; text-align: center;">${op.nombre}</td><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Lider:</td><td style="border: 1px solid #000; padding: 5px; text-align: center;"></td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Tipo de Capacitación:</td><td colspan="3" style="border: 1px solid #000; padding: 5px; text-align: center;">${ultimoEvento.tipo || ''}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td colspan="4" style="font-weight: bold; background-color: #1f497d; color: white; padding: 5px; border: 1px solid #000;">Respuestas correctas (Producto: ${cursoSelec})</td></tr><tr><td colspan="4" style="height: 120px; vertical-align: top; border: 1px solid #000; padding: 10px;">${obsExcel}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td colspan="4" style="font-weight: bold; background-color: #1f497d; color: white; padding: 5px; border: 1px solid #000;">Observaciones generales de la capacitación</td></tr><tr><td colspan="4" style="height: 60px; vertical-align: top; border: 1px solid #000; padding: 10px;">Nota obtenida: ${notaObtenida}. ${linkVerifHTML}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td style="font-weight: bold; background-color: #2c3e50; color: white; padding: 5px; border: 1px solid #000; text-align: center;">Sigla</td><td colspan="3" style="font-weight: bold; background-color: #2c3e50; color: white; padding: 5px; border: 1px solid #000;">Referencia de Capacitación</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">CE</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Entrenamiento / Capacitación</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">CR</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Re-entrenamiento</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">EI</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Entrenamiento Inicial</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">VA</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Verificación Anual</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">VRS</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Verificación de Requerimiento de Sector</td></tr></table>`;
+    let tablaActaHTML = `<table border="0" style="width: 100%; border-collapse: collapse;"><tr><td colspan="4" style="text-align: center; font-size: 14px; font-weight: bold; background-color: #c0392b; color: white; padding: 5px; border: 1px solid #000;">DOCUMENTO DE EXPORTACIÓN - LOS DATOS OFICIALES RESIDEN EXCLUSIVAMENTE EN EL SISTEMA GIC</td></tr><tr><td colspan="4" style="height: 15px;">&nbsp;</td></tr><tr><td colspan="4" style="text-align: center; font-size: 16px; font-weight: bold; background-color: #1f497d; color: white; padding: 10px; border: 1px solid #000;">INFORME DE CAPACITACIÓN</td></tr><tr><td colspan="4" style="height: 25px;">&nbsp;</td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2; width: 25%;">Fecha:</td><td style="border: 1px solid #000; padding: 5px; text-align: center; width: 25%;">${fechaVisual}</td><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2; width: 25%;">${etiquetaRol}</td><td style="border: 1px solid #000; padding: 5px; text-align: center; width: 25%;">${nombreIngresado}</td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Operador:</td><td style="border: 1px solid #000; padding: 5px; text-align: center;">${op.nombre}</td><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Lider:</td><td style="border: 1px solid #000; padding: 5px; text-align: center;"></td></tr><tr><td style="font-weight: bold; border: 1px solid #000; padding: 5px; background-color: #f2f2f2;">Tipo de Capacitación:</td><td colspan="3" style="border: 1px solid #000; padding: 5px; text-align: center;">${ultimoEvento.tipo || ''}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td colspan="4" style="font-weight: bold; background-color: #1f497d; color: white; padding: 5px; border: 1px solid #000;">Respuestas correctas / incorrectas / incompletas (Producto: ${cursoSelec})</td></tr><tr style="mso-height-source:auto;"><td colspan="4" style="vertical-align: top; border: 1px solid #000; padding: 10px; word-wrap: break-word; white-space: pre-wrap;">${obsExcel}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td colspan="4" style="font-weight: bold; background-color: #1f497d; color: white; padding: 5px; border: 1px solid #000;">Observaciones generales de la capacitación</td></tr><tr><td colspan="4" style="height: 60px; vertical-align: top; border: 1px solid #000; padding: 10px;">Nota obtenida: ${notaObtenida}. ${linkVerifHTML}</td></tr><tr><td colspan="4" style="height: 20px;">&nbsp;</td></tr><tr><td style="font-weight: bold; background-color: #2c3e50; color: white; padding: 5px; border: 1px solid #000; text-align: center;">Sigla</td><td colspan="3" style="font-weight: bold; background-color: #2c3e50; color: white; padding: 5px; border: 1px solid #000;">Referencia de Capacitación</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">CE</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Entrenamiento / Capacitación</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">CR</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Re-entrenamiento</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">EI</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Entrenamiento Inicial</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">VA</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Verificación Anual</td></tr><tr><td style="border: 1px solid #000; padding: 5px; font-weight: bold; text-align: center;">VRS</td><td colspan="3" style="border: 1px solid #000; padding: 5px;">Verificación de Requerimiento de Sector</td></tr></table>`;
     if (modoEdicion) {
         let htmlCompletado = `<html xmlns:x="urn:schemas-microsoft-com:office:excel"><head><meta charset="utf-8" /></head><body style="font-family: Arial, sans-serif;">${tablaActaHTML}</body></html>`;
         try { let blob = new Blob(['\ufeff' + htmlCompletado], { type: 'application/vnd.ms-excel;charset=utf-8;' }); let link = document.createElement("a"); let url = URL.createObjectURL(blob); link.href = url; link.download = `Informe_${op.nombre.replace(/\s+/g, '_')}_${cursoSelec}.xls`; link.style.display = "none"; document.body.appendChild(link); link.click(); document.body.removeChild(link); window.URL.revokeObjectURL(url); if (typeof registrarAccion === "function") registrarAccion(`Emitió Informe OFICIAL para ${op.nombre}`); } catch (e) { Swal.fire('Error', 'Tu navegador bloqueó la descarga del Excel.', 'error'); }
@@ -1400,4 +2524,840 @@ function descargarBackup() {
         showConfirmButton: false,
         timer: 2500
     });
+}
+
+
+/* -------------------- 🗑️ VACIAR MATRIZ Y AGENDA DIARIA -------------------- */
+async function resetearMatrizYAgendaDiaria() {
+    const { isConfirmed: paso1 } = await Swal.fire({
+        title: '⚠️ ¿Estás segura?',
+        html: 'Esta acción va a <strong>borrar todos los estados de capacitación</strong> de todos los operadores y <strong>vaciar la Agenda Diaria</strong>.<br><br>Los operadores y sus nombres se mantienen. <strong>Esta acción no se puede deshacer.</strong>',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonColor: '#c0392b',
+        cancelButtonColor: '#7f8c8d',
+        confirmButtonText: 'Sí, vaciar',
+        cancelButtonText: 'Cancelar'
+    });
+    if (!paso1) return;
+
+    const { value: confirmacion } = await Swal.fire({
+        title: 'Confirmación final',
+        text: 'Escribí VACIAR para confirmar:',
+        input: 'text',
+        showCancelButton: true,
+        confirmButtonColor: '#c0392b',
+        inputValidator: (v) => {
+            if (v !== 'VACIAR') return 'Escribí exactamente: VACIAR';
+        }
+    });
+    if (!confirmacion) return;
+
+    try {
+        // 1. Resetear estados de todos los operadores
+        operadores.forEach(op => { op.estados = {}; });
+        await db.ref('GAC_Sistema/operadores').set(operadores);
+
+        // 2. Vaciar sesiones (Agenda Diaria)
+        sesiones = [];
+        await db.ref('GAC_Sistema/sesiones').set([]);
+
+        registrarAccion('Vació la Matriz y la Agenda Diaria completa');
+        await guardarDatos();
+
+        await Swal.fire({
+            title: '✅ Listo',
+            text: 'La Matriz y la Agenda Diaria fueron vaciadas correctamente.',
+            icon: 'success',
+            timer: 2500,
+            showConfirmButton: false
+        });
+
+        location.reload();
+
+    } catch (error) {
+        Swal.fire('Error', 'No se pudo completar la operación: ' + error.message, 'error');
+    }
+}
+
+
+/* -------------------- 📥 IMPORTAR EVALUACIONES DESDE SURVEYMONKEY -------------------- */
+async function importarEvaluacionesSurveyMonkey() {
+
+    // Paso 1: elegir tipo y producto
+    const cursoNombres = [...new Set(Object.values(mapaCodigos))].sort();
+    const opcionesCursos = Object.fromEntries(cursoNombres.map(c => [c, c]));
+
+    const { value: cursoElegido } = await Swal.fire({
+        title: '📥 Importar desde SurveyMonkey',
+        text: 'Seleccioná el producto a cargar:',
+        input: 'select',
+        inputOptions: opcionesCursos,
+        showCancelButton: true,
+        confirmButtonText: 'Siguiente →',
+        allowOutsideClick: false
+    });
+    if (!cursoElegido) return;
+
+    const tipoOpciones = { 'CE': 'CE — Entrenamiento', 'CR': 'CR — Re-entrenamiento', 'VA': 'VA — Verificación Anual', 'VRS': 'VRS — Verif. Requerimiento Sector', 'EI': 'EI — Entrenamiento Inicial' };
+    const { value: tipoElegido } = await Swal.fire({
+        title: 'Tipo de capacitación',
+        input: 'select',
+        inputOptions: tipoOpciones,
+        showCancelButton: true,
+        confirmButtonText: 'Siguiente →',
+        allowOutsideClick: false
+    });
+    if (!tipoElegido) return;
+
+    // Código automático del mapa
+    const codigoAuto = Object.keys(mapaCodigos).find(k => mapaCodigos[k] === cursoElegido && k.startsWith(tipoElegido)) || '';
+
+    // Paso 2: datos del requerimiento + archivos
+    const entrenadorOpciones = {
+        'Solange Mieres': 'Solange Mieres',
+        'Hernán Caraballo': 'Hernán Caraballo',
+        'Julia Bandin': 'Julia Bandin',
+        'Julia Bandin / Hernán Caraballo': 'Julia Bandin / Hernán Caraballo',
+        'Julia Bandin / Solange Mieres': 'Julia Bandin / Solange Mieres',
+        'Hernán Caraballo / Solange Mieres': 'Hernán Caraballo / Solange Mieres',
+        'Julia Bandin / Hernán Caraballo / Solange Mieres': 'Julia Bandin / Hernán Caraballo / Solange Mieres'
+    };
+
+    const { value: datosReq } = await Swal.fire({
+        title: 'Datos del requerimiento',
+        width: '620px',
+        allowOutsideClick: false,
+        showCancelButton: true,
+        confirmButtonText: 'Siguiente →',
+        html: `
+            <div style="text-align:left; font-size:13px;">
+            <label style="font-weight:bold;">Entrenador/a</label>
+            <select id="req-entrenador" class="swal2-select" style="width:100%; margin:4px 0 10px;">
+                ${Object.keys(entrenadorOpciones).map(e => `<option value="${e}">${e}</option>`).join('')}
+            </select>
+            <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:10px;">
+                <div><label style="font-weight:bold;">Fecha Inicio</label>
+                <input type="date" id="req-fecha-inicio" class="swal2-input" style="margin:4px 0 0; width:100%;"></div>
+                <div><label style="font-weight:bold;">Fecha Fin</label>
+                <input type="date" id="req-fecha-fin" class="swal2-input" style="margin:4px 0 0; width:100%;"></div>
+                <div><label style="font-weight:bold;">Hora Inicio</label>
+                <input type="time" id="req-hora-inicio" class="swal2-input" style="margin:4px 0 0; width:100%;"></div>
+                <div><label style="font-weight:bold;">Hora Fin</label>
+                <input type="time" id="req-hora-fin" class="swal2-input" style="margin:4px 0 0; width:100%;"></div>
+            </div>
+            <label style="font-weight:bold;">🔗 Link de Verificación (SurveyMonkey)</label>
+            <input type="text" id="req-link-verif" class="swal2-input" placeholder="https://..." style="margin:4px 0 8px; width:100%;">
+            <label style="font-weight:bold;">🎮 Link de Kahoot (opcional)</label>
+            <input type="text" id="req-link-kahoot" class="swal2-input" placeholder="https://..." style="margin:4px 0 8px; width:100%;">
+            <label style="font-weight:bold;">⭐ Link de Encuesta (opcional)</label>
+            <input type="text" id="req-link-encuesta" class="swal2-input" placeholder="https://..." style="margin:4px 0 8px; width:100%;">
+            <hr style="margin:10px 0;">
+            <p style="font-weight:bold; margin-bottom:4px;">📁 Archivos de SurveyMonkey:</p>
+            <label style="font-weight:bold; font-size:12px;">1️⃣ Archivo de respuestas (.csv con nombre y fecha)</label>
+            <input type="file" id="csv-respuestas" accept=".csv" style="margin-bottom:8px; width:100%;">
+            <label style="font-weight:bold; font-size:12px;">2️⃣ Archivo QuizSummary.csv (con scores)</label>
+            <input type="file" id="csv-summary" accept=".csv" style="margin-bottom:4px; width:100%;">
+            </div>
+        `,
+        preConfirm: () => {
+            const r = document.getElementById('csv-respuestas').files[0];
+            const s = document.getElementById('csv-summary').files[0];
+            if (!r || !s) { Swal.showValidationMessage('Subí los dos archivos CSV'); return false; }
+            return {
+                entrenador: document.getElementById('req-entrenador').value,
+                fechaInicio: document.getElementById('req-fecha-inicio').value,
+                fechaFin: document.getElementById('req-fecha-fin').value,
+                horaInicio: document.getElementById('req-hora-inicio').value,
+                horaFin: document.getElementById('req-hora-fin').value,
+                linkVerificacion: document.getElementById('req-link-verif').value,
+                linkKahoot: document.getElementById('req-link-kahoot').value,
+                linkEncuesta: document.getElementById('req-link-encuesta').value,
+                respuestas: r, summary: s
+            };
+        }
+    });
+    if (!datosReq) return;
+    const archivos = { respuestas: datosReq.respuestas, summary: datosReq.summary };
+
+    // Paso 3: parsear CSVs
+    const leerCSV = (file) => new Promise((res) => {
+        const reader = new FileReader();
+        reader.onload = e => {
+            const lines = e.target.result.split(/\r?\n/).filter(l => l.trim());
+            const rows = lines.map(l => {
+                const result = [];
+                let cur = '', inQ = false;
+                for (const ch of l) {
+                    if (ch === '"') { inQ = !inQ; }
+                    else if (ch === ',' && !inQ) { result.push(cur.trim()); cur = ''; }
+                    else { cur += ch; }
+                }
+                result.push(cur.trim());
+                return result;
+            });
+            res(rows);
+        };
+        reader.readAsText(file, 'UTF-8');
+    });
+
+    Swal.fire({ title: 'Procesando...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+
+    const [rowsResp, rowsSum] = await Promise.all([leerCSV(archivos.respuestas), leerCSV(archivos.summary)]);
+
+    // Construir mapa scores — detecta automáticamente QuizSummary (%) o QuizResponses (puntos por pregunta)
+    const mapaScores = {};
+    const _subh = rowsSum[1] || [];
+    const _pointsCols = _subh.map((h, i) => h.trim() === 'Points' ? i : -1).filter(i => i >= 0);
+    const _esRespuestas = _pointsCols.length > 0;
+
+    for (let i = 2; i < rowsSum.length; i++) {
+        const row = rowsSum[i];
+        if (!row[0]) continue;
+        let score = null;
+        if (_esRespuestas) {
+            let totalC = 0, totalP = 0;
+            _pointsCols.forEach(col => {
+                const val = (row[col] || '');
+                if (val.includes('/')) {
+                    const parts = val.split('/');
+                    const c = parseInt(parts[0]), t = parseInt(parts[1]);
+                    if (!isNaN(c) && !isNaN(t)) { totalC += c; totalP += t; }
+                }
+            });
+            score = totalP > 0 ? Math.round(totalC / totalP * 100) : null;
+        } else {
+            const raw = (row[1] || '').replace('%', '').trim();
+            score = raw ? parseInt(raw) : null;
+        }
+        mapaScores[row[0]] = score;
+    }
+
+    // Parsear respuestas: respondent_id, nombre (col9), fecha (col10)
+    // 🔧 Normaliza el score sin importar cómo lo devuelva xlsx:
+    //  - Celda con formato %  → xlsx devuelve fracción (0.85)  → 85
+    //  - Texto "85%" / "85,5" → 85 / 85.5
+    //  - Kahoot (>100 pts)     → se deja tal cual
+    const registros = [];
+    for (let i = 2; i < rowsResp.length; i++) {
+        const row = rowsResp[i];
+        if (!row[0]) continue;
+        const rid = row[0];
+        const nombre = row[9] || '';
+        // Normalizar fecha: si viene en MM/DD/YYYY (formato americano) → convertir a DD/MM/YYYY
+const _fechaRaw = row[10] || '';
+const _fechaMatch = _fechaRaw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+const fecha = _fechaMatch
+    ? (_fechaMatch[2].padStart(2,'0') + '/' + _fechaMatch[1].padStart(2,'0') + '/' + _fechaMatch[3])
+    : _fechaRaw;
+        const scorePct = mapaScores[rid];
+        if (nombre) registros.push({ rid, nombre: nombre.trim().toUpperCase(), fecha: fecha.trim(), score: scorePct });
+    }
+
+    // Paso 4: cruzar con operadores del GIC — matching mejorado
+    // Normaliza acentos + minúsculas diferencias + similitud por palabras
+    const normNombre = s => s.toUpperCase()
+        .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^A-Z ]/g, '').replace(/\s+/g, ' ').trim();
+
+    const palabrasSimilar = (a, b) => {
+        if (a === b) return true;
+        if (Math.abs(a.length - b.length) > 2) return false;
+        let matches = 0;
+        for (let i = 0; i < Math.min(a.length, b.length); i++) { if (a[i] === b[i]) matches++; }
+        return matches / Math.max(a.length, b.length) >= 0.75;
+    };
+
+    const calcMatchScore = (csvName, opName) => {
+        const pc = normNombre(csvName).split(' ').filter(p => p.length > 2);
+        const po = normNombre(opName).split(' ').filter(p => p.length > 2);
+        return pc.filter(w => po.some(v => palabrasSimilar(w, v))).length;
+    };
+
+    const cruces = registros.map(reg => {
+        let mejorOp = null, mejorScore = 0;
+        operadores.forEach(o => {
+            const s = calcMatchScore(reg.nombre, o.nombre);
+            if (s > mejorScore) { mejorScore = s; mejorOp = o; }
+        });
+        const encontrado = mejorScore >= 2 ? mejorOp : null;
+        return { ...reg, operadorEncontrado: encontrado ? encontrado.nombre : null, operador: encontrado };
+    });
+
+    const encontrados = cruces.filter(c => c.operadorEncontrado);
+    const noEncontrados = cruces.filter(c => !c.operadorEncontrado);
+
+    Swal.close();
+
+    // #3 — chequeo de duplicados (mismo tipo + fecha + porcentaje ya en el historial)
+    const dupsSM = detectarDuplicados(encontrados.map(c => ({ nombreOp: c.operadorEncontrado, curso: cursoElegido, tipo: tipoElegido, fecha: c.fecha, porcentaje: c.score })));
+    const htmlDupsSM = dupsSM.length ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:5px;padding:8px;margin-bottom:8px;font-size:11px;color:#856404;"><strong>⚠️ ${dupsSM.length} posible(s) duplicado(s)</strong> (ya existe un registro igual):<br>${dupsSM.slice(0,10).join('<br>')}${dupsSM.length>10?`<br>…y ${dupsSM.length-10} más`:''}</div>` : '';
+
+    // Paso 5: mostrar preview
+    const htmlPreview = `
+        <div style="max-height:320px; overflow-y:auto; font-size:12px;">
+            ${htmlDupsSM}
+            <p style="margin-bottom:8px;"><strong>✅ ${encontrados.length} operadores encontrados</strong>${noEncontrados.length ? ` · ⚠️ ${noEncontrados.length} no encontrados` : ''}</p>
+            <table style="width:100%; border-collapse:collapse;">
+                <tr style="background:#f0f0f0;"><th style="padding:4px 8px; text-align:left;">CSV</th><th>GIC</th><th>Fecha</th><th>Score</th></tr>
+                ${encontrados.map(c => `<tr style="border-bottom:1px solid #eee;">
+                    <td style="padding:4px 8px; font-size:11px;">${c.nombre}</td>
+                    <td style="padding:4px 8px; font-size:11px; color:#27ae60;">${c.operadorEncontrado}</td>
+                    <td style="padding:4px 8px;">${c.fecha}</td>
+                    <td style="padding:4px 8px; font-weight:bold;">${c.score !== null && c.score !== undefined ? c.score+'%' : 'N/A'}</td>
+                </tr>`).join('')}
+                ${noEncontrados.map(c => `<tr style="border-bottom:1px solid #eee; background:#fff5f5;">
+                    <td style="padding:4px 8px; font-size:11px; color:#e74c3c;">${c.nombre}</td>
+                    <td style="padding:4px 8px; color:#e74c3c; font-size:11px;">No encontrado</td>
+                    <td style="padding:4px 8px;">${c.fecha}</td>
+                    <td style="padding:4px 8px;">${c.score !== null && c.score !== undefined ? c.score+'%' : 'N/A'}</td>
+                </tr>`).join('')}
+            </table>
+        </div>`;
+
+    const { isConfirmed } = await Swal.fire({
+        title: `Importar: ${cursoElegido} (${tipoElegido})`,
+        html: htmlPreview,
+        width: '700px',
+        showCancelButton: true,
+        confirmButtonText: `✅ Cargar ${encontrados.length} registros`,
+        cancelButtonText: 'Cancelar',
+        allowOutsideClick: false
+    });
+    if (!isConfirmed) return;
+
+    // Paso 6: cargar en Firebase
+    const fechaHoy = new Date().toISOString().split('T')[0];
+    for (const c of encontrados) {
+        const op = c.operador;
+        if (!op.estados) op.estados = {};
+        if (!op.estados[cursoElegido]) op.estados[cursoElegido] = { estado: 'rojo', historial: [] };
+        if (!op.estados[cursoElegido].historial) op.estados[cursoElegido].historial = [];
+
+        const scoreVal = c.score !== null && c.score !== undefined ? c.score : null;
+        op.estados[cursoElegido].estado = 'verde';
+        op.estados[cursoElegido].historial.push({
+            tipo: tipoElegido,
+            codigo: codigoAuto,
+            fecha: c.fecha || fechaHoy,
+            porcentaje: scoreVal !== null ? String(scoreVal) : 'N/A',
+            linkVerificacion: datosReq.linkVerificacion || ''
+        });
+    }
+
+    // Crear el requerimiento en la Agenda Diaria
+    const nuevaSesionId = Date.now().toString();
+    const convocadosSesion = encontrados.map(c => ({ nombre: c.operadorEncontrado, asistencia: 'Pres' }));
+    const nuevaSesion = {
+        id: nuevaSesionId,
+        tipo: tipoElegido,
+        entrenador: datosReq.entrenador,
+        cursos: [cursoElegido],
+        fechaInicio: datosReq.fechaInicio || new Date().toISOString().split('T')[0],
+        fechaFin: datosReq.fechaFin || datosReq.fechaInicio || new Date().toISOString().split('T')[0],
+        horaInicio: datosReq.horaInicio || '',
+        horaFin: datosReq.horaFin || '',
+        linkVerificacion: datosReq.linkVerificacion || '',
+        linkKahoot: datosReq.linkKahoot || '',
+        linkEncuesta: datosReq.linkEncuesta || '',
+        convocados: convocadosSesion,
+        activa: false,
+        estadoReq: 'Finalizado'
+    };
+    sesiones.push(nuevaSesion);
+    // Actividad vinculada
+    actividades.push({
+        id: 'ACT-' + nuevaSesionId,
+        idSesionVinculada: nuevaSesionId,
+        titulo: `🎓 ${tipoElegido} - ${cursoElegido}`,
+        tipo: 'Capacitación',
+        entrenador: datosReq.entrenador,
+        estado: 'Finalizado',
+        fecha: nuevaSesion.fechaInicio,
+        fechaHasta: nuevaSesion.fechaFin,
+        hora: nuevaSesion.horaInicio || ''
+    });
+
+    await guardarDatos();
+    registrarAccion(`Importó ${encontrados.length} evaluaciones de SurveyMonkey para ${cursoElegido} (${tipoElegido}) y creó requerimiento en Agenda`);
+
+    await Swal.fire({
+        icon: 'success',
+        title: '✅ Importación completa',
+        html: `Se cargaron <strong>${encontrados.length} registros</strong> en la matriz.${noEncontrados.length ? `<br><small style="color:#e74c3c">⚠️ ${noEncontrados.length} no encontrados: ${noEncontrados.map(c=>c.nombre).join(', ')}</small>` : ''}`,
+        timer: 4000
+    });
+
+    renderizarTabla();
+    actualizarDashboard();
+}
+
+/* -------------------- 📁 CARPETA DE EVALUACIONES -------------------- */
+function generarRutaOperador(nombre) {
+    // GIC: "AMOEDO MARIELA" → "Amoedo, Mariela"
+    const toTitle = s => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+    const partes = nombre.trim().split(/\s+/);
+    const apellido = toTitle(partes[0]);
+    const nombreResto = partes.slice(1).map(toTitle).join(' ');
+    const carpeta = apellido + (nombreResto ? ', ' + nombreResto : '');
+    return `\\\\central\\GDS\\Proyectos Tecnologicos\\Call_Center\\Registros y Documentos\\08_Archivo de evaluaciones OP\\${carpeta}`;
+}
+
+async function abrirCarpetaOperador(nombre) {
+    const ruta = generarRutaOperador(nombre).replace(/\\\\/g, '\\\\');
+    const rutaDisplay = `\\\\central\\GDS\\Proyectos Tecnologicos\\Call_Center\\Registros y Documentos\\08_Archivo de evaluaciones OP\\${(() => {
+        const toTitle = s => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+        const partes = nombre.trim().split(/\s+/);
+        const ap = toTitle(partes[0]);
+        const nom = partes.slice(1).map(toTitle).join(' ');
+        return ap + (nom ? ', ' + nom : '');
+    })()}`;
+
+    const { isConfirmed } = await Swal.fire({
+        title: `📁 Evaluaciones de ${nombre}`,
+        html: `
+            <p style="font-size:13px; color:#666; margin-bottom:8px;">Ruta de la carpeta en la red:</p>
+            <div style="background:#f4f6f9; border:1px solid #ccc; border-radius:6px; padding:10px; font-family:monospace; font-size:11.5px; word-break:break-all; text-align:left; color:#2c3e50; user-select:all;">
+                ${rutaDisplay}
+            </div>
+            <p style="font-size:12px; color:#888; margin-top:8px;">Copiá la ruta y pegala en la barra de direcciones del Explorador de Windows.</p>
+        `,
+        showCancelButton: true,
+        confirmButtonText: '📋 Copiar ruta',
+        cancelButtonText: 'Cerrar',
+        confirmButtonColor: '#2980b9',
+        allowOutsideClick: true
+    });
+    if (isConfirmed) {
+        const fallback = () => {
+            const tmp = document.createElement('textarea');
+            tmp.value = rutaDisplay;
+            document.body.appendChild(tmp);
+            tmp.select();
+            document.execCommand('copy');
+            document.body.removeChild(tmp);
+        };
+        try {
+            await navigator.clipboard.writeText(rutaDisplay);
+        } catch {
+            fallback();
+        }
+        showToast('✅ Ruta copiada — pegala en el Explorador (Ctrl+V en la barra de dirección)');
+    }
+}
+
+/* ================== 📋 IMPORTAR DESDE EXCEL RE/CONTROL ================== */
+async function importarDesdeExcelRE() {
+    if (typeof XLSX === 'undefined') {
+        Swal.fire('Error', 'Librería Excel no cargada. Recargá la página.', 'error');
+        return;
+    }
+    const { value: archivo } = await Swal.fire({
+        title: '📋 Importar desde Excel RE/Control',
+        html: `<p style="font-size:13px;color:#666;margin-bottom:12px;">Subí el archivo <strong>RE_Control_de_Asistentes_y_Resultados...</strong></p>
+               <input type="file" id="excel-re-input" accept=".xlsx,.xls" style="width:100%;">`,
+        showCancelButton: true, confirmButtonText: 'Leer →', allowOutsideClick: false,
+        preConfirm: () => {
+            const f = document.getElementById('excel-re-input').files[0];
+            if (!f) { Swal.showValidationMessage('Seleccioná un archivo'); return false; }
+            return f;
+        }
+    });
+    if (!archivo) return;
+
+    Swal.fire({ title: 'Leyendo archivo...', allowOutsideClick: false, didOpen: () => Swal.showLoading() });
+
+    const data = await new Promise((res, rej) => {
+        const rd = new FileReader();
+        rd.onload = e => res(e.target.result);
+        rd.onerror = rej;
+        rd.readAsArrayBuffer(archivo);
+    });
+
+    const wb = XLSX.read(data, { type: 'array', cellDates: true });
+    const nombreHoja = wb.SheetNames.find(n => n.toLowerCase().includes('control')) || wb.SheetNames[0];
+    const ws = wb.Sheets[nombreHoja];
+    if (!ws) { Swal.fire('Error', `No encontré la hoja de control. Hojas: ${wb.SheetNames.join(', ')}`, 'error'); return; }
+
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: null });
+
+    // Buscar en TODAS las columnas
+    const buscarFila = (keyword) => {
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i]; if (!row) continue;
+            for (let c = 0; c < row.length; c++) {
+                const cel = row[c];
+                if (cel && String(cel).toLowerCase().includes(keyword.toLowerCase())) return row;
+            }
+        }
+        return null;
+    };
+    const valorDeFila = (keyword) => {
+        const row = buscarFila(keyword);
+        if (!row) return '';
+        let keyCol = -1;
+        for (let c = 0; c < row.length; c++) {
+            if (row[c] && String(row[c]).toLowerCase().includes(keyword.toLowerCase())) { keyCol = c; break; }
+        }
+        for (let c = keyCol + 1; c < row.length; c++) {
+            if (row[c] !== null && row[c] !== undefined) {
+                const v = row[c];
+                if (v instanceof Date) return v.toLocaleDateString('es-AR');
+                const s = String(v).trim();
+                if (s && s !== '0') return s;
+            }
+        }
+        return '';
+    };
+
+    const tipoTexto    = valorDeFila('Requerimiento');
+    const tema         = valorDeFila('Tema');
+    const motivo       = valorDeFila('Motivo');
+    const capacitadora = valorDeFila('Capacitadora');
+    const fechaInicio  = valorDeFila('Fecha de inicio');
+    const fechaCierre  = valorDeFila('Fecha de cierre');
+    const linkVerif    = valorDeFila('Link de Verificaci');
+    const linkEncuesta = valorDeFila('Link de Encuesta');
+
+    const norm = s => s ? s.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim() : '';
+    const tipoMap = {
+        'entrenamiento inicial':'EI','entrenamiento eventual masivo':'CE',
+        'entrenamiento':'CE','reentrenamiento':'CR','re-entrenamiento':'CR',
+        'verificacion de conocimientos anual':'VA','verificacion':'VA','verificacion anual':'VA'
+    };
+    let tipoCE = tipoMap[norm(tipoTexto)] || 'CE';
+    if (norm(motivo).includes('requerimiento del sector') && tipoCE === 'VA') tipoCE = 'VRS';
+
+    // Encontrar fila "Participantes" en cualquier columna
+    let filaHeader = -1, colNombre = 1;
+    for (let i = 0; i < rows.length; i++) {
+        const row = rows[i]; if (!row) continue;
+        for (let c = 0; c < row.length; c++) {
+            const cel = row[c];
+            if (cel && String(cel).trim().toLowerCase() === 'participantes') {
+                filaHeader = i; colNombre = c; break;
+            }
+        }
+        if (filaHeader !== -1) break;
+    }
+    if (filaHeader === -1) {
+        Swal.fire('Error', 'No encontré la columna "Participantes" en el archivo.', 'error'); return;
+    }
+
+    // Mapear columnas de fecha y score desde el encabezado
+    const headerRow = rows[filaHeader];
+    let colFechaCE = -1, colScoreCE = -1, colFechaCR = -1, colScoreCR = -1;
+    headerRow.forEach((h, i) => {
+        if (!h) return;
+        const hn = norm(String(h));
+        if (colFechaCE === -1 && hn.includes('fecha de realizaci')) colFechaCE = i;
+        if (colScoreCE === -1 && hn === 'resultado') colScoreCE = i;
+        if (colFechaCR === -1 && colScoreCE !== -1 && hn.includes('fecha') && i > colScoreCE) colFechaCR = i;
+        if (colScoreCR === -1 && colScoreCE !== -1 && hn.includes('resultado') && i > colScoreCE) colScoreCR = i;
+    });
+
+    const normN = s => s ? s.replace(/\xa0/g,' ').replace(/\s+/g,' ').trim().toUpperCase() : '';
+    const fmtDate = v => {
+        if (!v) return null;
+        if (v instanceof Date) {
+            const d = String(v.getDate()).padStart(2,'0');
+            const m = String(v.getMonth()+1).padStart(2,'0');
+            return `${d}/${m}/${v.getFullYear()}`;
+        }
+        const s = String(v).trim();
+        const match = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+        if (match) return `${match[3]}/${match[2]}/${match[1]}`;
+        // Normalizar DD/M/YYYY → DD/MM/YYYY
+        const match2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+        if (match2) return `${match2[1].padStart(2,'0')}/${match2[2].padStart(2,'0')}/${match2[3]}`;
+        return s.split(' ')[0] || null;
+    };
+
+    const registros = [];
+    for (let i = filaHeader + 1; i < rows.length; i++) {
+        const row = rows[i];
+        if (!row || !row[colNombre]) continue;
+        const nombre = normN(String(row[colNombre]));
+        if (!nombre || nombre.length < 3 || nombre === 'PARTICIPANTES') continue;
+        const fechaCE = fmtDate(colFechaCE >= 0 ? row[colFechaCE] : null) || fechaCierre;
+        const scoreCE = (colScoreCE >= 0) ? normScore(row[colScoreCE]) : null;
+        const fechaCR = fmtDate(colFechaCR >= 0 ? row[colFechaCR] : null);
+        const scoreCR = (colScoreCR >= 0) ? normScore(row[colScoreCR]) : null;
+        registros.push({ nombre, fechaCE, scoreCE, fechaCR, scoreCR });
+    }
+
+    // Detectar productos (puede haber varios separados por " - ")
+    const simPal = (a, b) => {
+        if (a===b) return true;
+        if (a.length <= 4 || b.length <= 4) return false; // palabras cortas: solo match exacto
+        if (Math.abs(a.length-b.length)>2) return false;
+        let m=0; for(let i=0;i<Math.min(a.length,b.length);i++) if(a[i]===b[i]) m++;
+        return m/Math.max(a.length,b.length)>=0.80;
+    };
+    const calcMS = (a, b) => {
+        const pa=norm(a).split(' ').filter(p=>p.length>2);
+        const pb=norm(b).split(' ').filter(p=>p.length>2);
+        return pa.filter(w=>pb.some(v=>simPal(w,v))).length;
+    };
+    const productosUnicos = [...new Set(Object.values(mapaCodigos))].sort();
+    const temasDelExcel = tema.split(/\s*-\s*/).map(t=>t.trim()).filter(t=>t.length>2);
+    const productosDetectados = temasDelExcel.map(t => {
+        let mejor='', score=0;
+        productosUnicos.forEach(p=>{const s=calcMS(t,p);if(s>score){score=s;mejor=p;}});
+        return { temaOriginal: t, productoGIC: score>=1?mejor:'', score };
+    });
+
+    Swal.close();
+
+    const opcionesProd = Object.fromEntries(productosUnicos.map(p => [p, p]));
+    const esMultiple = temasDelExcel.length > 1;
+    let productosFinal = [];
+
+    if (esMultiple) {
+        const checkboxes = productosDetectados.map((pd, i) => `
+            <div style="margin-bottom:8px; padding:6px; background:#f7f9fc; border-radius:5px; border:1px solid #dde5ee;">
+                <label style="font-weight:bold; font-size:12px;">Tema ${i+1}: "${pd.temaOriginal}"</label><br>
+                <select id="prod-sel-${i}" style="width:100%; margin-top:4px; font-size:12px; padding:3px;">
+                    ${productosUnicos.map(p=>`<option value="${p}" ${p===pd.productoGIC?'selected':''}>${p}</option>`).join('')}
+                </select>
+                <label style="font-size:11px; margin-top:3px; display:block;">
+                    <input type="checkbox" id="prod-chk-${i}" checked> Incluir este producto
+                </label>
+            </div>`).join('');
+
+        const { value: confMulti } = await Swal.fire({
+            title: `${temasDelExcel.length} productos detectados`,
+            html: `<p style="font-size:12px;color:#666;margin-bottom:8px;">Verificá y confirmá cada producto:</p>${checkboxes}`,
+            width: '650px', showCancelButton: true, confirmButtonText: 'Siguiente →', allowOutsideClick: false,
+            preConfirm: () => {
+                const result = [];
+                productosDetectados.forEach((_, i) => {
+                    const chk = document.getElementById(`prod-chk-${i}`);
+                    const sel = document.getElementById(`prod-sel-${i}`);
+                    if (chk && chk.checked && sel) result.push(sel.value);
+                });
+                if (!result.length) { Swal.showValidationMessage('Seleccioná al menos un producto'); return false; }
+                return result;
+            }
+        });
+        if (!confMulti) return;
+        productosFinal = confMulti;
+    } else {
+        const { value: prodConfirmado } = await Swal.fire({
+            title: 'Confirmar producto',
+            html: `<p style="font-size:13px;color:#666;margin-bottom:8px;">
+                     Tema en Excel: <strong>"${tema||'No detectado'}"</strong><br>
+                     Operadores leídos: <strong>${registros.length}</strong><br>
+                     Seleccioná el producto del GIC:
+                   </p>`,
+            input: 'select', inputOptions: opcionesProd, inputValue: productosDetectados[0]?.productoGIC||productosUnicos[0],
+            showCancelButton: true, confirmButtonText: 'Siguiente →', allowOutsideClick: false
+        });
+        if (!prodConfirmado) return;
+        productosFinal = [prodConfirmado];
+    }
+    const mejorProd = productosFinal[0];
+
+    const tipoOpciones = {'CE':'CE — Entrenamiento','CR':'CR — Re-entrenamiento','VA':'VA — Verificación Anual','VRS':'VRS — Verif. Requerimiento Sector','EI':'EI — Entrenamiento Inicial'};
+    const { value: tipoConfirmado } = await Swal.fire({
+        title: 'Confirmar tipo',
+        html: `<p style="font-size:13px;color:#666;margin-bottom:8px;">Tipo detectado: <strong>${tipoTexto||'No detectado'}</strong></p>`,
+        input: 'select', inputOptions: tipoOpciones, inputValue: tipoCE,
+        showCancelButton: true, confirmButtonText: 'Siguiente →', allowOutsideClick: false
+    });
+    if (!tipoConfirmado) return;
+    tipoCE = tipoConfirmado;
+
+    // Cruzar con GIC
+    const calcOp = (a,b) => { const pa=norm(a).split(' ').filter(p=>p.length>2); const pb=norm(b).split(' ').filter(p=>p.length>2); return pa.filter(w=>pb.some(v=>simPal(w,v))).length; };
+    const cruces = registros.map(reg => {
+        let mejorOp=null, ms=0;
+        operadores.forEach(o=>{const s=calcOp(reg.nombre,o.nombre);if(s>ms){ms=s;mejorOp=o;}});
+        const palabrasLargas = norm(reg.nombre).split(' ').filter(p=>p.length>3);
+        const match1 = ms>=1 && palabrasLargas.some(w=>norm(mejorOp?.nombre||'').includes(w));
+        return {...reg, op:(ms>=2||match1)?mejorOp:null, mejorMatch:mejorOp, mejorScore:ms};
+    });
+    const encontrados = cruces.filter(c=>c.op);
+    const noEncontrados = cruces.filter(c=>!c.op);
+
+    // #3 — chequeo de duplicados (mismo tipo + fecha + porcentaje ya en el historial)
+    let regsParaChequear = [];
+    productosFinal.forEach(prod => {
+        encontrados.forEach(c => {
+            regsParaChequear.push({ nombreOp: c.op.nombre, curso: prod, tipo: tipoCE, fecha: c.fechaCE || fechaCierre, porcentaje: c.scoreCE });
+        });
+    });
+    const dupsRE = detectarDuplicados(regsParaChequear);
+    const htmlDupsRE = dupsRE.length ? `<div style="background:#fff3cd;border:1px solid #ffc107;border-radius:5px;padding:8px;margin-bottom:8px;font-size:11px;color:#856404;"><strong>⚠️ ${dupsRE.length} posible(s) duplicado(s)</strong> (ya existe un registro igual):<br>${dupsRE.slice(0,10).join('<br>')}${dupsRE.length>10?`<br>…y ${dupsRE.length-10} más`:''}</div>` : '';
+
+    const htmlPrev = `<div style="font-size:12px;text-align:left;max-height:330px;overflow-y:auto;">
+        <p><strong>📦 Producto:</strong> ${mejorProd} &nbsp;|&nbsp; <strong>🎓 Tipo:</strong> ${tipoCE}</p>
+        ${htmlDupsRE}
+        <p style="margin-bottom:8px;"><strong>✅ ${encontrados.length} encontrados</strong>${noEncontrados.length?` &nbsp;|&nbsp; ⚠️ ${noEncontrados.length} no encontrados`:''}</p>
+        <table style="width:100%;border-collapse:collapse;">
+          <tr style="background:#f0f0f0;font-weight:bold;"><td style="padding:3px 5px;">Excel</td><td style="padding:3px 5px;">GIC</td><td style="padding:3px 5px;">Fecha</td><td style="padding:3px 5px;">Score</td></tr>
+          ${encontrados.map(c=>`<tr style="border-bottom:1px solid #eee;">
+            <td style="padding:3px 5px;font-size:11px;">${c.nombre}</td>
+            <td style="padding:3px 5px;font-size:11px;color:#27ae60;">${c.op.nombre}</td>
+            <td style="padding:3px 5px;">${c.fechaCE||fechaCierre||'-'}</td>
+            <td style="padding:3px 5px;font-weight:bold;">${c.scoreCE!==null?c.scoreCE+(parseInt(c.scoreCE)>100?' pts':'%'):'N/A'}</td>
+          </tr>`).join('')}
+          ${noEncontrados.map(c=>`<tr style="background:#fff5f5;">
+            <td style="padding:3px 5px;font-size:11px;color:#e74c3c;">${c.nombre}</td>
+            <td style="padding:3px 5px;font-size:11px;color:#888;">Mejor: ${c.mejorMatch?c.mejorMatch.nombre+' ('+c.mejorScore+')':'ninguno'}</td>
+            <td colspan="2" style="padding:3px 5px;color:#e74c3c;font-size:11px;">No encontrado</td>
+          </tr>`).join('')}
+        </table></div>`;
+
+    const { isConfirmed } = await Swal.fire({
+        title:`Importar: ${mejorProd}`, html:htmlPrev, width:'680px',
+        showCancelButton:true, confirmButtonText:`✅ Cargar ${encontrados.length} operadores`, allowOutsideClick:false
+    });
+    if (!isConfirmed) return;
+
+    const fechaHoy = new Date().toISOString().split('T')[0];
+    for (const prod of productosFinal) {
+        const codCE = Object.keys(mapaCodigos).find(k=>mapaCodigos[k]===prod&&k.startsWith(tipoCE))||'';
+        const codCR = Object.keys(mapaCodigos).find(k=>mapaCodigos[k]===prod&&k.startsWith('CR'))||'';
+        for (const c of encontrados) {
+            const op = c.op;
+            if (!op.estados) op.estados = {};
+            if (!op.estados[prod]) op.estados[prod] = {estado:'rojo',historial:[]};
+            if (!op.estados[prod].historial) op.estados[prod].historial = [];
+            op.estados[prod].estado = 'verde';
+            op.estados[prod].historial.push({
+                tipo:tipoCE, codigo:codCE,
+                fecha:c.fechaCE||fechaCierre||fechaHoy,
+                porcentaje:c.scoreCE!==null?String(c.scoreCE):'N/A',
+                linkVerificacion:(linkVerif&&linkVerif!=='N/A'?linkVerif:'') || (linkEncuesta&&linkEncuesta!=='N/A'?linkEncuesta:'')||''
+            });
+            if (c.fechaCR && codCR) {
+                op.estados[prod].historial.push({tipo:'CR',codigo:codCR,fecha:c.fechaCR,porcentaje:c.scoreCR!==null?String(c.scoreCR):'N/A',linkVerificacion:''});
+            }
+        }
+    }
+    const sid=Date.now().toString();
+    sesiones.push({id:sid,tipo:tipoCE,entrenador:capacitadora||usuarioActual,cursos:productosFinal,
+        fechaInicio:fechaInicio||fechaHoy,fechaFin:fechaCierre||fechaHoy,horaInicio:'',horaFin:'',
+        linkVerificacion:linkVerif&&linkVerif!=='N/A'?linkVerif:'',linkKahoot:'',
+        linkEncuesta:linkEncuesta&&linkEncuesta!=='N/A'?linkEncuesta:'',
+        convocados:encontrados.map(c=>({nombre:c.op.nombre,asistencia:'Pres'})),activa:false,estadoReq:'Finalizado'
+    });
+    actividades.push({id:'ACT-'+sid,idSesionVinculada:sid,titulo:`🎓 ${tipoCE} - ${productosFinal.join(' + ')}`,tipo:'Capacitación',
+        entrenador:capacitadora||usuarioActual,estado:'Finalizado',fecha:fechaInicio||fechaHoy,fechaHasta:fechaCierre||fechaHoy,hora:''
+    });
+    await guardarDatos();
+    registrarAccion(`Importó ${encontrados.length} registros desde Excel RE para ${productosFinal.join('+')} (${tipoCE})`);
+    await Swal.fire({icon:'success',title:'✅ Importación completa',
+        html:`<strong>${encontrados.length} operadores</strong> cargados en ${productosFinal.length} producto(s).${noEncontrados.length?`<br><small style="color:#e74c3c">⚠️ ${noEncontrados.length} no encontrados</small>`:''}`,
+        timer:4000});
+    renderizarTabla(); actualizarDashboard();
+}
+
+/* ================== 🗑️ BORRAR CARGA MASIVA ================== */
+async function borrarCargaMasiva() {
+    const productosUnicos = [...new Set(Object.values(mapaCodigos))].sort();
+    const opcionesProd = Object.fromEntries(productosUnicos.map(p => [p, p]));
+    const { value: prodElegido } = await Swal.fire({
+        title: '🗑️ Borrar carga masiva',
+        text: 'Seleccioná el producto del que querés eliminar registros:',
+        input: 'select', inputOptions: opcionesProd,
+        showCancelButton: true, confirmButtonText: 'Siguiente →', confirmButtonColor: '#c0392b', allowOutsideClick: false
+    });
+    if (!prodElegido) return;
+
+    const { value: tipoElegido } = await Swal.fire({
+        title: `Tipo a eliminar — ${prodElegido}`,
+        input: 'select',
+        inputOptions: {'TODOS':'⚠️ Todos los tipos','CE':'CE — Entrenamiento','CR':'CR — Re-entrenamiento','VA':'VA — Verificación Anual','VRS':'VRS — Verif. Requerimiento Sector','EI':'EI — Entrenamiento Inicial'},
+        showCancelButton: true, confirmButtonText: 'Siguiente →', confirmButtonColor: '#c0392b', allowOutsideClick: false
+    });
+    if (!tipoElegido) return;
+
+    const { value: fechaFiltro } = await Swal.fire({
+        title: 'Filtrar por fecha (opcional)',
+        text: 'Dejá vacío para eliminar todos los registros del tipo seleccionado:',
+        input: 'text', inputPlaceholder: 'DD/MM/AAAA — opcional',
+        showCancelButton: true, confirmButtonText: 'Ver afectados →', confirmButtonColor: '#c0392b', allowOutsideClick: false
+    });
+    if (fechaFiltro === undefined) return;
+
+    const afectados = [];
+    operadores.forEach(op => {
+        if (!op.estados || !op.estados[prodElegido]) return;
+        const hist = op.estados[prodElegido].historial || [];
+        const cnt = hist.filter(e => {
+            const matchTipo = tipoElegido === 'TODOS' || e.tipo === tipoElegido;
+            const matchFecha = !fechaFiltro || (e.fecha && e.fecha.includes(fechaFiltro.trim()));
+            return matchTipo && matchFecha;
+        }).length;
+        if (cnt > 0) afectados.push({ op, cantidad: cnt });
+    });
+
+    if (afectados.length === 0) { Swal.fire('Sin resultados', 'No se encontraron registros con ese criterio.', 'info'); return; }
+
+    const { isConfirmed } = await Swal.fire({
+        title: `Borrar: ${prodElegido} — ${tipoElegido}${fechaFiltro?' — '+fechaFiltro:''}`,
+        html: `<div style="font-size:12px;text-align:left;max-height:280px;overflow-y:auto;">
+            <p style="color:#c0392b;font-weight:bold;">⚠️ Se van a eliminar registros de <strong>${afectados.length} operadores</strong></p>
+            <table style="width:100%;border-collapse:collapse;">
+              <tr style="background:#f0f0f0;font-weight:bold;"><td style="padding:3px 6px;">Operador</td><td style="padding:3px 6px;">Registros</td></tr>
+              ${afectados.map(a=>`<tr style="border-bottom:1px solid #eee;"><td style="padding:3px 6px;">${a.op.nombre}</td><td style="padding:3px 6px;color:#c0392b;font-weight:bold;">${a.cantidad}</td></tr>`).join('')}
+            </table></div>`,
+        icon: 'warning', showCancelButton: true,
+        confirmButtonText: `🗑️ Eliminar ${afectados.reduce((t,a)=>t+a.cantidad,0)} registros`,
+        confirmButtonColor: '#c0392b', allowOutsideClick: false
+    });
+    if (!isConfirmed) return;
+
+    let totalBorrados = 0;
+    operadores.forEach(op => {
+        if (!op.estados || !op.estados[prodElegido]) return;
+        const histAntes = op.estados[prodElegido].historial || [];
+        const histDespues = histAntes.filter(e => {
+            const matchTipo = tipoElegido === 'TODOS' || e.tipo === tipoElegido;
+            const matchFecha = !fechaFiltro || (e.fecha && e.fecha.includes(fechaFiltro.trim()));
+            return !(matchTipo && matchFecha);
+        });
+        totalBorrados += histAntes.length - histDespues.length;
+        op.estados[prodElegido].historial = histDespues;
+        if (histDespues.length === 0) op.estados[prodElegido].estado = 'rojo';
+    });
+
+    await guardarDatos();
+    registrarAccion(`Borró masivamente ${totalBorrados} registros de ${prodElegido} (${tipoElegido}${fechaFiltro?', fecha: '+fechaFiltro:''})`);
+    await Swal.fire({icon:'success',title:'✅ Borrado completo',text:`Se eliminaron ${totalBorrados} registros de ${afectados.length} operadores.`,timer:3000,showConfirmButton:false});
+    renderizarTabla(); actualizarDashboard();
+}
+
+/* ================== 📁 CARPETA DE EVALUACIONES ================== */
+function generarRutaOperador(nombre) {
+    const toTitle = s => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+    const partes = nombre.trim().split(/\s+/);
+    const apellido = toTitle(partes[0]);
+    const nombreResto = partes.slice(1).map(toTitle).join(' ');
+    const carpeta = apellido + (nombreResto ? ', ' + nombreResto : '');
+    return `\\\\central\\GDS\\Proyectos Tecnologicos\\Call_Center\\Registros y Documentos\\08_Archivo de evaluaciones OP\\${carpeta}`;
+}
+
+async function abrirCarpetaOperador(nombre) {
+    const toTitle = s => s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+    const partes = nombre.trim().split(/\s+/);
+    const ap = toTitle(partes[0]);
+    const nom = partes.slice(1).map(toTitle).join(' ');
+    const rutaDisplay = `\\\\central\\GDS\\Proyectos Tecnologicos\\Call_Center\\Registros y Documentos\\08_Archivo de evaluaciones OP\\${ap + (nom ? ', ' + nom : '')}`;
+
+    const { isConfirmed } = await Swal.fire({
+        title: `📁 Evaluaciones de ${nombre}`,
+        html: `<p style="font-size:13px;color:#666;margin-bottom:8px;">Ruta de la carpeta en la red:</p>
+               <div style="background:#f4f6f9;border:1px solid #ccc;border-radius:6px;padding:10px;font-family:monospace;font-size:11.5px;word-break:break-all;text-align:left;color:#2c3e50;user-select:all;">${rutaDisplay}</div>
+               <p style="font-size:12px;color:#888;margin-top:8px;">Copiá la ruta y pegala en la barra de direcciones del Explorador de Windows.</p>`,
+        showCancelButton: true, confirmButtonText: '📋 Copiar ruta', cancelButtonText: 'Cerrar',
+        confirmButtonColor: '#2980b9', allowOutsideClick: true
+    });
+    if (isConfirmed) {
+        const fallback = () => { const tmp=document.createElement('textarea'); tmp.value=rutaDisplay; document.body.appendChild(tmp); tmp.select(); document.execCommand('copy'); tmp.remove(); };
+        try { await navigator.clipboard.writeText(rutaDisplay); } catch { fallback(); }
+        showToast('✅ Ruta copiada — pegala en el Explorador (Ctrl+V en la barra de dirección)');
+    }
 }
