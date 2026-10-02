@@ -311,6 +311,25 @@ async function guardarDatos() {
     }
 }
 
+// Guarda sólo los campos indicados (bitacoraPlanificacion, seguimientoSeleccion, notificacionAdriana)
+// con update() sobre el mismo path que ya usa guardarDatos() -> mismos permisos, y al ser update()
+// (no set()) no pisa el resto del nodo. Nunca tira: si falla, avisa y deja seguir la UI en vez de
+// cortar en silencio (eso era lo que hacía parecer que la bitácora "no dejaba escribir").
+async function guardarCampoGAC(cambios) {
+    try {
+        await db.ref('GAC_Sistema').update(cambios);
+        return true;
+    } catch (err) {
+        console.error('Error al guardar:', err);
+        if (err.code === 'PERMISSION_DENIED') {
+            Swal.fire({ icon: 'error', title: 'Sin permiso', text: 'No podés guardar cambios. Activá la edición con tu usuario.', timer: 3000, showConfirmButton: false });
+        } else {
+            Swal.fire({ icon: 'error', title: 'No se pudo guardar', text: 'Revisá tu conexión e intentá de nuevo.', timer: 3000, showConfirmButton: false });
+        }
+        return false;
+    }
+}
+
 function registrarAccion(detalle, usuarioEspecial = null) {
     if (!modoEdicion && !usuarioEspecial) return; 
     let now = new Date();
@@ -1342,13 +1361,13 @@ async function toggleSeguimiento(idSesion) {
     let idStr = idSesion.toString();
     let i = seguimientoSeleccion.indexOf(idStr);
     if (i >= 0) seguimientoSeleccion.splice(i, 1); else seguimientoSeleccion.push(idStr);
-    await db.ref('GAC_Sistema/seguimientoSeleccion').set(seguimientoSeleccion);
+    await guardarCampoGAC({ seguimientoSeleccion });
     renderizarSesiones();
 }
 
 async function vaciarSeguimiento() {
     seguimientoSeleccion = [];
-    await db.ref('GAC_Sistema/seguimientoSeleccion').set([]);
+    await guardarCampoGAC({ seguimientoSeleccion });
     renderizarSesiones();
 }
 
@@ -1389,8 +1408,9 @@ async function verificarSeguimientoCompleto() {
     let nombres = elegidos.map(s => (s.cursos && s.cursos.length > 0) ? s.cursos.join('+') : (s.curso || 'Sin producto'));
     let mensaje = `Se completó el 100% del seguimiento conjunto: ${nombres.join(' | ')}`;
     registrarAccion(`Seguimiento conjunto llegó al 100% (${nombres.join(' | ')})`);
-    await db.ref('GAC_Sistema/notificacionAdriana').set({ mensaje, fecha: new Date().toLocaleString('es-AR'), vista: false });
-    await db.ref('GAC_Sistema/seguimientoSeleccion').set([]); // se vacía para poder armar el próximo seguimiento
+    let nuevoAviso = { mensaje, fecha: new Date().toLocaleString('es-AR'), vista: false };
+    await guardarCampoGAC({ notificacionAdriana: nuevoAviso, seguimientoSeleccion: [] }); // se vacía para poder armar el próximo seguimiento
+    seguimientoSeleccion = [];
     Swal.fire({ icon: 'success', title: '🎉 ¡100% completado!', text: 'Se dejó un aviso para Adriana la próxima vez que entre al sistema.', timer: 3500, showConfirmButton: false });
 }
 
@@ -1405,7 +1425,7 @@ async function mostrarNotificacionAdrianaSiHay() {
         confirmButtonColor: '#27ae60'
     });
     if (isConfirmed) {
-        await db.ref('GAC_Sistema/notificacionAdriana/vista').set(true);
+        await guardarCampoGAC({ notificacionAdriana: { ...notificacionAdriana, vista: true } });
     }
 }
 
@@ -1717,8 +1737,8 @@ async function guardarComentarioDiario() {
     let hora = new Date().toLocaleTimeString('es-AR', { hour: '2-digit', minute: '2-digit' });
     bitacoraPlanificacion[fecha].push({ autor, texto, hora });
     registrarAccion(`Agregó comentario en bitácora diaria (${fecha})`);
-    await db.ref('GAC_Sistema/bitacoraPlanificacion').set(bitacoraPlanificacion);
-    abrirBitacoraDiaria(); // refrescar
+    await guardarCampoGAC({ bitacoraPlanificacion });
+    abrirBitacoraDiaria(); // refrescar (se vuelve a abrir siempre, haya guardado bien o no)
 }
 
 async function eliminarComentarioDiario(dia, index) {
@@ -1728,7 +1748,7 @@ async function eliminarComentarioDiario(dia, index) {
         bitacoraPlanificacion[dia].splice(index, 1);
         if (bitacoraPlanificacion[dia].length === 0) delete bitacoraPlanificacion[dia];
         registrarAccion(`Eliminó comentario de bitácora diaria (${dia})`);
-        await db.ref('GAC_Sistema/bitacoraPlanificacion').set(bitacoraPlanificacion);
+        await guardarCampoGAC({ bitacoraPlanificacion });
     }
     abrirBitacoraDiaria();
 }
